@@ -1,27 +1,51 @@
+# Its own workspace root: a plugin, only ever built for wasm32-wasip2 (and
+# natively for its unit tests).
+[workspace]
+
 [package]
-publish = false  # internal crate, never published to crates.io
-name = "sicompass-webbrowser"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "Sicompass web browser provider"
+name = "webbrowser-plugin"
+version = "0.2.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "A web browser for sicompass: pages as lists, rendered by Chrome, as a WASM plugin"
+repository = "https://github.com/friendlyflow/webbrowser_plugin_sicompass"
+# A plugin ships as a signed release the sicompass Store installs, never on crates.io.
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
 
 [dependencies]
-sicompass-sdk = { workspace = true }
-chromiumoxide = "0.9"
-serde = { workspace = true }
-futures = "0.3"
-which = "8"
-tokio = { workspace = true }
+# The guest kit and the FFON model (with the HTML walker the pages go
+# through). By git until sicompass-sdk 0.9 and sicompass-pdk 0.6 are on
+# crates.io; the pdk uses the SDK from the same rev.
+sicompass-pdk = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", rev = "faed1702fbc26c4a4c7ae062e567997916d83cef" }
+sicompass-sdk = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", rev = "faed1702fbc26c4a4c7ae062e567997916d83cef", default-features = false }
+serde = { version = "1", features = ["derive"] }
+# The DevTools protocol is JSON.
+serde_json = "1"
 # Reading `<link rel="alternate" hreflang>` out of `<head>`, which the SDK
-# walker skips whole. Same version the SDK already pulls in, so this shares
-# its build rather than adding a second copy.
+# walker skips whole. Same version the SDK already pulls in.
 scraper = "0.27"
 
+# Natively, for the live tests, Chrome's pipes on file descriptors 3 and 4.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
-tokio = { workspace = true }
-# Isolating the URL-history file from the developer's real one.
-tempfile = { workspace = true }
-# Reading the geometry and banding decisions back out of the page. Test-only:
-# the script itself hands Chrome a string and gets a string back.
-serde_json = { workspace = true }
+tempfile = "3"
+
+[profile.release]
+# Guests ship as bytecode, and App Store builds interpret rather than JIT them, so
+# a small module matters more than aggressive inlining.
+opt-level = "s"
+lto = true
+strip = true
+
+# Working on the SDK and this plugin together: uncomment, and comment it out
+# again before committing. With it live, a green build proves nothing about what
+# the pinned rev resolves to.
+#
+# [patch."https://github.com/friendlyflow/sicompass-plugin-sdk"]
+# sicompass-pdk = { path = "../sicompass-plugin-sdk/sicompass-pdk" }
+# sicompass-sdk = { path = "../sicompass-plugin-sdk" }

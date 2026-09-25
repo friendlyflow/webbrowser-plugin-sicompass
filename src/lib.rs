@@ -1,7 +1,8 @@
 //! Web browser provider — Rust port of `lib_webbrowser/`.
 //!
-//! Fetches a URL via a real Chrome browser (chromiumoxide, kept off the user's
-//! screen by xvfb-run on Linux and by off-screen window placement on Windows),
+//! A sicompass WASM plugin. Fetches a URL via a real Chrome browser (driven
+//! over the DevTools protocol on a pipe, see `cdp`, from a host task, see
+//! `worker`, and kept off the user's screen on a virtual X display),
 //! parses the rendered HTML with scraper (html5ever), and converts the DOM to a
 //! flat FFON tree of strings and objects that mirrors the C provider's
 //! lexbor-based output.
@@ -32,25 +33,13 @@
 //!   image          (str)  — "alt text [img]"
 //! ```
 
-use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
-use futures::StreamExt as _;
-use sicompass_sdk::ffon::{FfonElement, FormMap, FormNodeKind};
-use sicompass_sdk::localize;
-use sicompass_sdk::provider::Provider;
-use std::sync::OnceLock;
+mod cdp;
+mod localize;
+mod worker;
 
-/// Register this crate's translation bundles with the SDK localizer.
-/// Idempotent.
-pub fn register_translations() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let _ = localize::register_bundle("en-US", include_str!("../locales/en-US.ftl"));
-        let _ = localize::register_bundle("nl-BE", include_str!("../locales/nl-BE.ftl"));
-        let _ = localize::register_bundle("fr-BE", include_str!("../locales/fr-BE.ftl"));
-        let _ = localize::register_bundle("de-BE", include_str!("../locales/de-BE.ftl"));
-    });
-}
+use sicompass_pdk::{Descriptor, Plugin, PollResult, export_plugin};
+use sicompass_sdk::ffon::{FfonElement, FormMap, FormNodeKind};
+
 #[cfg(test)]
 use sicompass_sdk::ffon::html_to_ffon;
 use sicompass_sdk::ffon::{html_resolve_href, html_submit_selector, html_to_ffon_with_forms};
@@ -153,24 +142,6 @@ struct CachedPage {
     elements: Vec<FfonElement>,
 }
 
-/// Hand-off slot: a background load or submit task fills it, `tick` drains it.
-type ReadySlot = Arc<Mutex<Option<(Vec<FfonElement>, FormMap)>>>;
-
-// ---------------------------------------------------------------------------
-// Live page session — kept alive for form interaction
-//
-// Non-Windows only.  On Windows the screen reader (NVDA / Narrator) would
-// traverse the off-screen Chrome window via UI Automation; instead we launch
-// a fresh Chrome for every page load and form submit, and keep cookies on
-// disk in the persistent profile dir (`%TEMP%/sicompass-chrome`).
-// ---------------------------------------------------------------------------
-
-#[cfg(not(target_os = "windows"))]
-struct LivePageSession {
-    session: BrowserSession,
-    page: chromiumoxide::Page,
-}
-
 // ---------------------------------------------------------------------------
 // WebbrowserProvider
 // ---------------------------------------------------------------------------
@@ -183,35 +154,24 @@ pub struct WebbrowserProvider {
     path_cache: String, // "/" or "/seg0/seg1/…", rebuilt on every push/pop
     cached_page: Option<CachedPage>,
     form_map: FormMap,
-    // Shared so the background page-load task can create and reuse the Chrome
-    // session. A cold launch is the single longest operation in the app (15s
-    // timeout) and used to run inline on the render thread.
-    #[cfg(not(target_os = "windows"))]
-    live: Arc<tokio::sync::Mutex<Option<LivePageSession>>>,
-    // Guards against a second load being spawned for the same navigation.
-    #[cfg(not(target_os = "windows"))]
-    load_inflight: Arc<AtomicBool>,
-    // Where a URL committed *during* a load waits its turn. The running task
-    // picks it up when it finishes, so a second navigation is neither dropped
-    // nor run concurrently with the first. Only the newest is kept: a URL the
-    // user has already typed past is not worth a page load.
-    #[cfg(not(target_os = "windows"))]
-    pending_url: Arc<Mutex<Option<String>>>,
-    // Background thread delivers refreshed content here after form submission.
-    ready_content: ReadySlot,
+    // The browser task (see `worker`), started on the first page load. A
+    // cold Chrome launch is the single longest operation in the app, and it
+    // never runs on the UI's call.
+    worker: Option<worker::Worker>,
+    // Numbers the navigations sent to the browser task. An answer for an
+    // older one is for a URL the user has already moved past, and is dropped.
+    nav_seq: u64,
+    // A navigation is loading: `fetch` shows "Loading…".
+    loading: bool,
+    // Set when an answer from the browser task changed what `fetch` shows.
+    landed: bool,
     // Typed form values, replayed into a fresh Chrome at submit time.  Source
     // of truth for what the user has filled in between page-load and submit.
     // Cleared on URL navigation and after a successful submit-response render.
     form_field_values: HashMap<String, String>,
-    // Errors surfaced by the submit thread (drift detection, launch failures,
-    // network errors).  Drained by `take_error`; `Arc<Mutex>` because the
-    // submit thread writes into it from a `std::thread::spawn` background.
+    // Errors from the browser task (launch failures, network errors), drained
+    // by `take_error`.
     pending_error: Arc<Mutex<Option<String>>>,
-    // Windows only: single-flight guard preventing a second submit press from
-    // racing the first (each submit cold-launches its own Chrome, so two in
-    // parallel would contend on the singleton profile dir).
-    #[cfg(target_os = "windows")]
-    submit_in_flight: Arc<AtomicBool>,
     // Set when a URL navigation starts, consumed when its content lands: the
     // cursor is parked on the URL bar the user just typed into, so the app is
     // asked to descend into the page content once there is content to read.
@@ -251,21 +211,16 @@ impl WebbrowserProvider {
     pub fn new() -> Self {
         WebbrowserProvider {
             current_url: String::new(),
-            #[cfg(not(target_os = "windows"))]
-            live: Arc::new(tokio::sync::Mutex::new(None)),
-            #[cfg(not(target_os = "windows"))]
-            load_inflight: Arc::new(AtomicBool::new(false)),
-            #[cfg(not(target_os = "windows"))]
-            pending_url: Arc::new(Mutex::new(None)),
             path_segments: Vec::new(),
             path_cache: "/".to_owned(),
             cached_page: None,
             form_map: FormMap::new(),
-            ready_content: Arc::new(Mutex::new(None)),
+            worker: None,
+            nav_seq: 0,
+            loading: false,
+            landed: false,
             form_field_values: HashMap::new(),
             pending_error: Arc::new(Mutex::new(None)),
-            #[cfg(target_os = "windows")]
-            submit_in_flight: Arc::new(AtomicBool::new(false)),
             pending_enter_content: false,
             enter_content_request: false,
             url_history: Vec::new(),
@@ -284,14 +239,8 @@ impl WebbrowserProvider {
         };
     }
 
-    /// Navigate to `url`.
-    ///
-    /// On non-Windows, reuses the persistent live session (or creates one
-    /// first).  On Windows, cold-launches Chrome, fetches the HTML, and closes
-    /// Chrome again so the off-screen window is never present in the screen
-    /// reader's UI Automation tree while the user reads / fills the page.
-    /// Cookies and localStorage survive in the fixed `%TEMP%/sicompass-chrome`
-    /// profile dir.
+    /// Navigate to `url`: hand it to the browser task, which reuses the live
+    /// Chrome (or starts one first). The page arrives through `tick`.
     fn load_url(&mut self, url: &str) {
         // URL is changing: any form values typed for the previous page are stale.
         self.form_field_values.clear();
@@ -324,74 +273,109 @@ impl WebbrowserProvider {
             return;
         }
 
-        // Non-Windows: hand the whole load to the runtime. Launching Chrome and
-        // navigating can take seconds, and doing it here froze the frame for
-        // the duration — SDL events went unpolled, AT-SPI went unserviced, and
-        // a screen reader dropped focus tracking. `tick` already drains
-        // `ready_content` every frame, so the result lands the same way a form
-        // submit response does.
-        #[cfg(not(target_os = "windows"))]
-        {
-            self.current_url = url.to_owned();
+        self.current_url = url.to_owned();
+        self.nav_seq += 1;
+        self.loading = true;
+        let job = worker::Job::Navigate {
+            seq: self.nav_seq,
+            url: url.to_owned(),
+            prune: prune_hidden(),
+        };
+        self.send_to_worker(&job);
+    }
 
-            if self.load_inflight.swap(true, Ordering::AcqRel) {
-                // A load is already running. Hand it the new destination rather
-                // than dropping it: the two share one Chrome tab, so a second
-                // task would interleave with the first and the loser's HTML
-                // would land under the winner's URL. The running task picks
-                // this up as soon as it is done.
-                queue_pending(&self.pending_url, url);
-                return;
-            }
-
-            let live = Arc::clone(&self.live);
-            let ready = Arc::clone(&self.ready_content);
-            let errors = Arc::clone(&self.pending_error);
-            let inflight = Arc::clone(&self.load_inflight);
-            let pending = Arc::clone(&self.pending_url);
-            let mut target = url.to_owned();
-
-            chromium_runtime().spawn(async move {
-                // One navigation per turn, then drain whatever the user typed
-                // while it was running. `load_inflight` stays set for the whole
-                // chain, so `fetch` keeps showing "Loading…" and no second task
-                // is ever spawned alongside this one.
-                loop {
-                    navigate_once(&live, &ready, &errors, &pending, &target).await;
-                    match next_target(&inflight, &pending) {
-                        Some(next) => target = next,
-                        None => return,
-                    }
-                }
-            });
-
-            return;
-        }
-
-        #[cfg(target_os = "windows")]
-        let result = chromium_runtime().block_on(fetch_html_once(url));
-
-        #[cfg(target_os = "windows")]
-        {
-            match result {
-                Ok(load) => {
-                    let (elements, form_map) = page_to_ffon_with_forms(&load, url);
-                    self.cached_page = Some(CachedPage {
-                        url: url.to_owned(),
-                        elements,
-                    });
-                    self.form_map = form_map;
-                }
+    /// Hand the browser task `job`, starting it on first use. A task that
+    /// cannot start reports why, as a failed load would.
+    fn send_to_worker(&mut self, job: &worker::Job) {
+        if self.worker.is_none() {
+            match worker::Worker::start() {
+                Ok(w) => self.worker = Some(w),
                 Err(e) => {
-                    self.cached_page = Some(CachedPage {
-                        url: url.to_owned(),
-                        elements: vec![FfonElement::new_str(format!("Error loading {url}: {e}"))],
+                    self.apply_done(worker::Done::Failed {
+                        seq: self.nav_seq,
+                        error: format!("Error launching browser: {e}"),
                     });
-                    self.form_map = FormMap::new();
+                    return;
                 }
             }
-            self.current_url = url.to_owned();
-            self.content_landed();
+        }
+        if let Some(w) = &self.worker
+            && let Err(e) = w.send(job)
+        {
+            self.worker = None;
+            self.apply_done(worker::Done::Failed {
+                seq: self.nav_seq,
+                error: format!("Error launching browser: {e}"),
+            });
+        }
+    }
+
+    /// Take an answer from the browser task.
+    fn apply_done(&mut self, done: worker::Done) {
+        match done {
+            worker::Done::Page {
+                seq,
+                submitted,
+                page,
+            } => {
+                if seq != self.nav_seq {
+                    return;
+                }
+                let (elements, form_map) = page.into_parts();
+                self.cached_page = Some(CachedPage {
+                    url: self.current_url.clone(),
+                    elements,
+                });
+                self.form_map = form_map;
+                if !submitted {
+                    self.loading = false;
+                }
+                // A new page is showing: typed values no longer apply to any
+                // field on it.
+                self.form_field_values.clear();
+                self.content_landed();
+                self.landed = true;
+            }
+            worker::Done::Failed { seq, error } => {
+                if seq != self.nav_seq {
+                    return;
+                }
+                // Both page content and a status-line error: the content is
+                // what unsticks a "Loading…" view, and it reads as a page
+                // saying what went wrong.
+                set_error(&self.pending_error, error.clone());
+                self.cached_page = Some(CachedPage {
+                    url: self.current_url.clone(),
+                    elements: vec![FfonElement::new_str(error)],
+                });
+                self.form_map = FormMap::new();
+                self.loading = false;
+                self.content_landed();
+                self.landed = true;
+            }
+            worker::Done::Error { error } => {
+                set_error(&self.pending_error, error);
+                self.landed = true;
+            }
+            worker::Done::Rendered { url, page } => {
+                let elements = sicompass_sdk::ffon::parse_json(&page).unwrap_or_default();
+                #[cfg(target_arch = "wasm32")]
+                sicompass_pdk::host::page_rendered(&url, &elements);
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = (url, elements);
+            }
+        }
+    }
+
+    /// Take what the native browser thread finished (in the sandbox answers
+    /// come through `on_task_event`).
+    fn drain_worker(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let done = self.worker.as_ref().map(|w| w.drain()).unwrap_or_default();
+            for d in done {
+                self.apply_done(d);
+            }
         }
     }
 
@@ -427,7 +411,8 @@ impl WebbrowserProvider {
         if test_no_history() {
             return None;
         }
-        sicompass_sdk::platform::app_state_dir().map(|s| s.join("webbrowser").join("history"))
+        // The plugin's storage folder. Natively (the tests) nowhere.
+        cfg!(target_arch = "wasm32").then(|| std::path::PathBuf::from("/storage").join("history"))
     }
 
     /// Read every line of the history file, newest first, plus the set of URLs
@@ -561,7 +546,7 @@ impl WebbrowserProvider {
             return;
         };
         if let Some(parent) = path.parent() {
-            sicompass_sdk::platform::make_dirs(parent);
+            let _ = std::fs::create_dir_all(parent);
         }
         let mut content = String::with_capacity(self.url_history.len() * 32);
         for url in &self.url_history {
@@ -571,7 +556,7 @@ impl WebbrowserProvider {
             content.push_str(url);
             content.push('\n');
         }
-        sicompass_sdk::platform::atomic_write(&path, &content);
+        atomic_write(&path, &content);
     }
 
     /// Put `url` at the top of the recall history, in memory and on disk.
@@ -660,7 +645,6 @@ impl WebbrowserProvider {
     fn history_buttons(&self) -> Vec<FfonElement> {
         // Not `init()`: the in-crate tests build providers without it, and an
         // unregistered message id resolves to the id itself.
-        register_translations();
         let marker = localize::t("webbrowser-bookmark-marker");
         self.url_history
             .iter()
@@ -706,91 +690,24 @@ impl WebbrowserProvider {
         patch_form_field_in_tree(&mut page.elements, form_name, &prefix, &replacement);
     }
 
-    /// Windows submit path: cold-launch Chrome on a background thread,
-    /// navigate to the current URL, refill every typed value, click submit,
-    /// fetch the response page, and close Chrome again.
-    ///
-    /// Cookies persist via the fixed `%TEMP%/sicompass-chrome` profile dir,
-    /// so login sessions survive across the close-then-reopen cycle.
-    /// Cold-launch + navigate + settle adds ~5–10 s of latency between the
-    /// submit press and the response page rendering — accepted for the
-    /// accessibility gain of no Chrome window in the UIA tree during fill.
-    #[cfg(target_os = "windows")]
-    fn submit_form_windows(&mut self, form_n: usize) {
-        // Test stub: never launch Chrome from tests.
-        if test_no_launch() {
-            set_error(
-                &self.pending_error,
-                "test-no-launch: submit skipped".to_owned(),
-            );
-            return;
-        }
-
-        // Single-flight: a second submit press while one is in flight would
-        // contend on the singleton profile dir's SingletonLock.
-        if self.submit_in_flight.swap(true, Ordering::AcqRel) {
-            set_error(
-                &self.pending_error,
-                "Submit already in progress; please wait for the response.".to_owned(),
-            );
-            return;
-        }
-
-        let url = self.current_url.clone();
-        let stored_values = self.form_field_values.clone();
-        let ready = Arc::clone(&self.ready_content);
-        let error_slot = Arc::clone(&self.pending_error);
-        let in_flight = Arc::clone(&self.submit_in_flight);
-
-        std::thread::spawn(move || {
-            // Drop guard: clear `in_flight` on every exit path, including panic.
-            struct ClearOnDrop(Arc<AtomicBool>);
-            impl Drop for ClearOnDrop {
-                fn drop(&mut self) {
-                    self.0.store(false, Ordering::Release);
-                }
-            }
-            let _guard = ClearOnDrop(in_flight);
-
-            chromium_runtime().block_on(submit_form_windows_async(
-                url,
-                form_n,
-                stored_values,
-                ready,
-                error_slot,
-            ));
-        });
-    }
-
-    /// Fill a form field via CDP. Called from `commit_edit` when the path
-    /// resolves to a known form-map entry.
-    ///
-    /// Non-Windows only.  On Windows there is no persistent Chrome page to
-    /// fill into; typed values are replayed in the submit thread.
-    #[cfg(not(target_os = "windows"))]
-    fn cdp_fill_field(&self, form_key: &str, value: &str) -> bool {
+    /// Fill a form field in the live page. Called from `commit_edit` when the
+    /// path resolves to a known form-map entry.
+    fn cdp_fill_field(&mut self, form_key: &str, value: &str) -> bool {
         let Some(node) = self.form_map.get(form_key) else {
             return false;
         };
-        // Locking here still occupies the frame, but these are single CDP
-        // round-trips, not a page load.
-        let guard = chromium_runtime().block_on(self.live.lock());
-        let Some(live) = guard.as_ref() else {
-            return false;
-        };
-        let selector = node.css_selector.clone();
-        let form_index = node.form_index;
-        let match_index = node.match_index;
         // A form-less control (search box) has no submit button, so committing
         // its value also submits via an Enter key sequence.
-        let submit = form_index == 0;
-        let value = value.to_owned();
-        let page = live.page.clone();
-        let js = build_fill_js(form_index, match_index, &selector, &value, submit);
-        let result = chromium_runtime().block_on(async move {
-            tokio::time::timeout(tokio::time::Duration::from_secs(5), page.evaluate(js)).await
-        });
-        result.map(|r| r.is_ok()).unwrap_or(false)
+        let submit = node.form_index == 0;
+        let js = build_fill_js(
+            node.form_index,
+            node.match_index,
+            &node.css_selector,
+            value,
+            submit,
+        );
+        self.send_to_worker(&worker::Job::Fill { js });
+        true
     }
 }
 
@@ -800,16 +717,17 @@ impl Default for WebbrowserProvider {
     }
 }
 
-impl Provider for WebbrowserProvider {
-    fn name(&self) -> &str {
+// The provider's side of each host call, in the shapes the tests use. The
+// `Plugin` impl below adapts them to the plugin interface.
+impl WebbrowserProvider {
+    pub fn name(&self) -> &str {
         "webbrowser"
     }
-    fn display_name(&self) -> String {
-        register_translations();
+    pub fn display_name(&self) -> String {
         localize::t("webbrowser-display-name")
     }
 
-    fn fetch(&mut self) -> Vec<FfonElement> {
+    pub fn fetch(&mut self) -> Vec<FfonElement> {
         let mut result = Vec::new();
 
         // URL bar element
@@ -828,8 +746,7 @@ impl Provider for WebbrowserProvider {
         // element that has children, and neither a "Loading…" placeholder nor
         // the previous page is worth dropping the user into. The descent is
         // asked for through `take_navigation_request` once the page lands.
-        #[cfg(not(target_os = "windows"))]
-        if self.load_inflight.load(Ordering::Acquire) {
+        if self.loading {
             result.push(FfonElement::new_str(url_bar));
             result.push(FfonElement::new_str("Loading…".to_owned()));
             // History stays put while loading. Dropping it here would shrink
@@ -859,30 +776,24 @@ impl Provider for WebbrowserProvider {
         result
     }
 
-    fn commit_edit(&mut self, _old: &str, new_content: &str) -> bool {
+    pub fn commit_edit(&mut self, _old: &str, new_content: &str) -> bool {
         // Check if the current path points to a form field.
-        if let Some(form_key) = extract_form_key(&self.path_cache) {
-            if self.form_map.contains_key(&form_key) {
-                // Record the typed value so it can be replayed at submit time.
-                // (On Windows there is no live Chrome to fill into; on other
-                // platforms we still fill the live DOM AND remember the value
-                // so the two stay in sync if the user resubmits after a tick.)
-                self.form_field_values
-                    .insert(form_key.clone(), new_content.to_owned());
-                // Non-Windows: fill the live Chrome DOM as a side effect.
-                #[cfg(not(target_os = "windows"))]
-                {
-                    self.cdp_fill_field(&form_key, new_content);
-                }
-                // Persist the value in cached_page so that any future re-fetch
-                // returns it.  Return false so the app does NOT call
-                // refresh_current_directory — that would re-invoke fetch() and
-                // overwrite the value the app's unconditional local-FFON update
-                // already wrote into r.ffon (handlers.rs, "Update FFON element
-                // regardless of commit result").
-                self.patch_cached_form_field(&form_key, new_content);
-                return false;
-            }
+        if let Some(form_key) = extract_form_key(&self.path_cache)
+            && self.form_map.contains_key(&form_key)
+        {
+            // Record the typed value, and fill the live Chrome DOM with it
+            // as a side effect.
+            self.form_field_values
+                .insert(form_key.clone(), new_content.to_owned());
+            self.cdp_fill_field(&form_key, new_content);
+            // Persist the value in cached_page so that any future re-fetch
+            // returns it.  Return false so the app does NOT call
+            // refresh_current_directory — that would re-invoke fetch() and
+            // overwrite the value the app's unconditional local-FFON update
+            // already wrote into r.ffon (handlers.rs, "Update FFON element
+            // regardless of commit result").
+            self.patch_cached_form_field(&form_key, new_content);
+            return false;
         }
         // Otherwise treat as URL navigation.
         let Some(full_url) = normalize_url_input(new_content) else {
@@ -898,28 +809,28 @@ impl Provider for WebbrowserProvider {
         true
     }
 
-    fn push_path(&mut self, segment: &str) {
+    pub fn push_path(&mut self, segment: &str) {
         self.path_segments.push(segment.to_owned());
         self.rebuild_path_cache();
     }
 
-    fn pop_path(&mut self) {
+    pub fn pop_path(&mut self) {
         self.path_segments.pop();
         self.rebuild_path_cache();
     }
 
-    fn current_path(&self) -> &str {
+    pub fn current_path(&self) -> &str {
         &self.path_cache
     }
 
-    fn set_current_path(&mut self, path: &str) {
+    pub fn set_current_path(&mut self, path: &str) {
         // Store the path as-is; clear segment tracking since we can't reliably
         // split on '/' when segments may contain "://" (URL values).
         self.path_cache = path.to_owned();
         self.path_segments.clear();
     }
 
-    fn on_button_press(&mut self, function_name: &str) {
+    pub fn on_button_press(&mut self, function_name: &str) {
         // A recall-history row: load it, and lift it back to the top so the
         // list stays ranked by last use. Identical to typing the same URL into
         // the bar, including arming the descent into the page content.
@@ -940,118 +851,56 @@ impl Provider for WebbrowserProvider {
         };
         let form_n: usize = form_n_str.parse().unwrap_or(0);
 
-        #[cfg(target_os = "windows")]
-        {
-            self.submit_form_windows(form_n);
-        }
+        let (selector, match_index) = self
+            .form_map
+            .iter()
+            .find(|(key, node)| {
+                key.starts_with(&format!("form_{form_n}/"))
+                    && matches!(node.kind, FormNodeKind::Submit)
+            })
+            .map(|(_, node)| (node.css_selector.clone(), node.match_index))
+            .unwrap_or_else(|| (html_submit_selector("", ""), 0));
 
-        #[cfg(not(target_os = "windows"))]
-        {
-            let (selector, match_index) = self
-                .form_map
-                .iter()
-                .find(|(key, node)| {
-                    key.starts_with(&format!("form_{form_n}/"))
-                        && matches!(node.kind, FormNodeKind::Submit)
-                })
-                .map(|(_, node)| (node.css_selector.clone(), node.match_index))
-                .unwrap_or_else(|| (html_submit_selector("", ""), 0));
-
-            let guard = chromium_runtime().block_on(self.live.lock());
-            let Some(live) = guard.as_ref() else {
-                return;
-            };
-            let page = live.page.clone();
-            let ready = Arc::clone(&self.ready_content);
-            let url = self.current_url.clone();
-
-            std::thread::spawn(move || {
-                // Resolve the submit button within its form (document.forms is in
-                // document order, matching form_n), or against document for a
-                // form-less control. Fall back to form.submit() for real forms.
-                let js = format!(
-                    "(() => {{ const fi = {form_n}; \
-                     const root = fi > 0 ? (document.forms[fi-1] || document) : document; \
-                     const el = root.querySelectorAll({})[{match_index}]; \
-                     if (el) {{ el.click(); return true; }} \
-                     if (fi > 0 && document.forms[fi-1]) {{ document.forms[fi-1].submit(); return true; }} \
-                     return false; }})()",
-                    js_quote(&selector)
-                );
-                chromium_runtime().block_on(async move {
-                    let _ = tokio::time::timeout(
-                        tokio::time::Duration::from_secs(5),
-                        page.evaluate(js),
-                    )
-                    .await;
-                    // Wait for the page to settle after the click. A fixed
-                    // guess is not enough: a consent choice reloads in place and
-                    // a submit navigates, and at a desktop viewport bpost takes
-                    // longer than 2.5 s to put its content back — serialising
-                    // early handed back a page with its whole middle missing.
-                    await_stable_url(&page, tokio::time::Duration::from_secs(10)).await;
-                    await_page_settled(&page, tokio::time::Duration::from_secs(12)).await;
-                    if let Ok(Ok(html)) = tokio::time::timeout(
-                        tokio::time::Duration::from_secs(20),
-                        settled_html(&page),
-                    )
-                    .await
-                    {
-                        // Answering one step is what leads to the next: a
-                        // language choice usually lands on a page whose cookie
-                        // banner has yet to be answered. A submit can also land
-                        // on a bot check just as a navigation can, so either way
-                        // the response goes through the same renderer.
-                        let landed =
-                            tokio::time::timeout(tokio::time::Duration::from_secs(5), page.url())
-                                .await
-                                .ok()
-                                .and_then(|r| r.ok())
-                                .flatten()
-                                .unwrap_or_else(|| url.clone());
-                        let (load, _) = settle_gates(&page, &landed, html).await;
-                        let (elements, form_map) = page_to_ffon_with_forms(&load, &landed);
-                        if let Ok(mut guard) = ready.lock() {
-                            *guard = Some((elements, form_map));
-                        }
-                    }
-                });
-            });
-        }
+        // Resolve the submit button within its form (document.forms is in
+        // document order, matching form_n), or against document for a
+        // form-less control. Fall back to form.submit() for real forms.
+        let js = format!(
+            "(() => {{ const fi = {form_n}; \
+             const root = fi > 0 ? (document.forms[fi-1] || document) : document; \
+             const el = root.querySelectorAll({})[{match_index}]; \
+             if (el) {{ el.click(); return true; }} \
+             if (fi > 0 && document.forms[fi-1]) {{ document.forms[fi-1].submit(); return true; }} \
+             return false; }})()",
+            js_quote(&selector)
+        );
+        let job = worker::Job::Submit {
+            seq: self.nav_seq,
+            js,
+            url: self.current_url.clone(),
+            prune: prune_hidden(),
+        };
+        self.send_to_worker(&job);
     }
 
-    fn tick(&mut self) -> bool {
-        let content = self.ready_content.lock().ok().and_then(|mut g| g.take());
-        if let Some((elements, form_map)) = content {
-            self.cached_page = Some(CachedPage {
-                url: self.current_url.clone(),
-                elements,
-            });
-            self.form_map = form_map;
-            // Submit-response page is now showing: old typed values no longer
-            // apply to any field on this page.  Clear them so a subsequent
-            // submit on a new form starts from a clean slate.
-            self.form_field_values.clear();
-            self.content_landed();
-            return true;
-        }
-        false
+    pub fn tick(&mut self) -> bool {
+        self.drain_worker();
+        std::mem::take(&mut self.landed)
     }
 
-    fn take_navigation_request(&mut self) -> Option<sicompass_sdk::NavigationRequest> {
+    pub fn take_navigation_request(&mut self) -> Option<sicompass_sdk::NavigationRequest> {
         std::mem::take(&mut self.enter_content_request)
             .then_some(sicompass_sdk::NavigationRequest::EnterChildren)
     }
 
-    fn take_error(&mut self) -> Option<String> {
+    pub fn take_error(&mut self) -> Option<String> {
         self.pending_error.lock().ok().and_then(|mut g| g.take())
     }
 
-    fn init(&mut self) {
+    pub fn init(&mut self) {
         self.load_url_history();
     }
 
-    fn on_setting_change(&mut self, key: &str, value: &str) {
+    pub fn on_setting_change(&mut self, key: &str, value: &str) {
         if key == "urlHistorySize" {
             // Garbage is ignored rather than reset to a default: a typo in the
             // settings file should not silently discard the user's history.
@@ -1062,26 +911,14 @@ impl Provider for WebbrowserProvider {
         }
     }
 
-    fn cleanup(&mut self) {
-        // Non-Windows: close the persistent Chrome session cleanly.
-        // Windows: no persistent session — any in-flight submit thread owns
-        // its own session and will close it on its own.
-        #[cfg(not(target_os = "windows"))]
-        {
-            if let Some(live) = chromium_runtime().block_on(self.live.lock()).take() {
-                use chromiumoxide::cdp::browser_protocol::browser::CloseParams;
-                let _ = chromium_runtime().block_on(async {
-                    tokio::time::timeout(
-                        tokio::time::Duration::from_millis(500),
-                        live.session.browser.execute(CloseParams::default()),
-                    )
-                    .await
-                });
-            }
+    pub fn cleanup(&mut self) {
+        // Close Chrome cleanly. Dropping the handle ends the browser task.
+        if let Some(w) = self.worker.take() {
+            let _ = w.send(&worker::Job::Close);
         }
     }
 
-    fn commands(&self) -> Vec<String> {
+    pub fn commands(&self) -> Vec<String> {
         // Labelled by what pressing it does, not by the current state.
         let hidden_toggle = if prune_hidden() {
             CMD_SHOW_HIDDEN
@@ -1098,7 +935,7 @@ impl Provider for WebbrowserProvider {
         ]
     }
 
-    fn handle_command(
+    pub fn handle_command(
         &mut self,
         cmd: &str,
         _elem_key: &str,
@@ -1144,7 +981,6 @@ impl WebbrowserProvider {
     /// spoke, so a bare "Bookmarked" would make a second consecutive bookmark
     /// silent.
     fn handle_toggle_bookmark_command(&mut self, elem_key: &str, error: &mut String) {
-        register_translations();
         let Some(url) = self.bookmark_target(elem_key) else {
             *error = localize::t("webbrowser-bookmark-nothing");
             return;
@@ -1187,77 +1023,20 @@ impl WebbrowserProvider {
         sanitize_history_url(&self.current_url)
     }
 
-    /// Clear all cookies from the persistent profile. On non-Windows there is a
-    /// live browser holding the cookie store open, so clear it over CDP (which
-    /// also empties the backing store). On Windows each fetch uses a throwaway
-    /// browser, so there is nothing live to clear — remove the cookie files from
-    /// the persistent profile dir instead.
-    ///
-    /// Also sweeps the language preference 0.1.17 used to keep, since this is
-    /// the command for "forget what has been remembered about me".
-    #[cfg_attr(target_os = "windows", allow(unused_variables))]
-    fn clear_cookies(&mut self, error: &mut String) {
-        remove_stale_language_pref();
-        #[cfg(not(target_os = "windows"))]
-        {
-            let guard = chromium_runtime().block_on(self.live.lock());
-            if let Some(live) = guard.as_ref() {
-                use chromiumoxide::cdp::browser_protocol::network::ClearBrowserCookiesParams;
-                let page = live.page.clone();
-                let res = chromium_runtime().block_on(async {
-                    tokio::time::timeout(
-                        tokio::time::Duration::from_secs(5),
-                        page.execute(ClearBrowserCookiesParams::default()),
-                    )
-                    .await
-                });
-                if !matches!(res, Ok(Ok(_))) {
-                    *error = "Could not clear cookies (browser not responding)".to_owned();
-                }
-                return;
-            }
-            // No live session: nothing in memory, clear the on-disk store.
-            remove_cookie_files(&chrome_profile_dir());
-        }
-        #[cfg(target_os = "windows")]
-        {
-            remove_cookie_files(&chrome_profile_dir());
-        }
+    /// Clear all cookies from the persistent profile: over CDP when Chrome is
+    /// running (which also empties the backing store), and from the profile
+    /// on disk when it is not. The browser task does either.
+    fn clear_cookies(&mut self, _error: &mut String) {
+        self.send_to_worker(&worker::Job::ClearCookies);
     }
 }
 
-/// Where 0.1.17 kept the remembered language choice, or `None` under test.
-///
-/// Next to the Chrome profile rather than inside it, which is what kept it out
-/// of the way of `clear cookies` back when the choice was worth keeping.
-/// Nothing writes this any more — the file is only still named here so the
-/// leftover can be swept up. Derived rather than hardcoded so it keeps pointing
-/// at the same place if the profile dir ever moves.
-fn stale_language_pref_path() -> Option<std::path::PathBuf> {
-    if test_no_history() {
-        return None;
-    }
-    Some(stale_language_pref_in(&chrome_profile_dir()))
-}
-
-/// The derivation on its own, so a test can pin the location without a real
-/// config dir and without turning the persistence guard off.
-fn stale_language_pref_in(profile: &std::path::Path) -> std::path::PathBuf {
-    profile
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(std::env::temp_dir)
-        .join("webbrowser-language")
-}
-
-/// Delete the leftover language preference, if this machine ever wrote one.
-///
-/// The language step is gone (see the gate section), so the file is dead state
-/// that would otherwise sit in the config dir forever. Safe to drop this, and
-/// its caller in `clear_cookies`, once 0.1.17 is far enough behind.
-fn remove_stale_language_pref() {
-    if let Some(path) = stale_language_pref_path() {
-        let _ = std::fs::remove_file(path);
+/// Write `contents` to `path` through a temporary file and a rename, so a
+/// reader (another tab's provider) never sees it half-written.
+fn atomic_write(path: &std::path::Path, contents: &str) {
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, contents).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 
@@ -1358,7 +1137,7 @@ fn build_fill_js(
 /// prefix matches, inside the Obj whose key matches `form_name` (exact or suffix,
 /// to handle `<id>X</id>form_N` keys produced by id-prefixed forms).
 fn patch_form_field_in_tree(
-    elems: &mut Vec<FfonElement>,
+    elems: &mut [FfonElement],
     form_name: &str,
     prefix: &str,
     replacement: &str,
@@ -1369,11 +1148,11 @@ fn patch_form_field_in_tree(
         };
         if obj.key == form_name || obj.key.ends_with(form_name) {
             for child in obj.children.iter_mut() {
-                if let FfonElement::Str(s) = child {
-                    if s.starts_with(prefix) {
-                        *s = replacement.to_owned();
-                        return true;
-                    }
+                if let FfonElement::Str(s) = child
+                    && s.starts_with(prefix)
+                {
+                    *s = replacement.to_owned();
+                    return true;
                 }
             }
         }
@@ -1484,1187 +1263,91 @@ pub(crate) fn set_error(slot: &Arc<Mutex<Option<String>>>, msg: String) {
     }
 }
 
-/// Report a failed page load as *both* page content and a status-line error.
-///
-/// The content half is what unsticks the view.  `fetch` renders "Loading…"
-/// while `load_inflight` is set, and `tick` — which returns true only when
-/// `ready_content` has been filled — is the sole thing that makes the app
-/// re-`fetch` afterwards (`needs_refresh` stays false for this provider).  A
-/// failure that filled only the error slot therefore left the URL bar reading
-/// "Loading…" forever, and never surfaced the error either: the app drains
-/// provider errors on that same tick signal.  Filling both slots means a
-/// browser that will not launch (no Chrome installed, launch timed out) shows
-/// up as a readable page saying so.
-#[cfg(not(target_os = "windows"))]
-fn publish_load_failure(ready: &ReadySlot, errors: &Arc<Mutex<Option<String>>>, msg: String) {
-    set_error(errors, msg.clone());
-    if let Ok(mut g) = ready.lock() {
-        *g = Some((vec![FfonElement::new_str(msg)], FormMap::new()));
-    }
+/// Seconds, for the timeouts below.
+fn secs(n: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(n)
 }
 
-// ---------------------------------------------------------------------------
-// Pending-navigation queue
-//
-// A one-slot, newest-wins queue between the UI thread and the running load
-// task.  Committing a URL while a load is in flight puts it here instead of
-// spawning a second task: both would drive the same Chrome tab, and the loser's
-// HTML would be cached under the winner's URL.
-// ---------------------------------------------------------------------------
-
-/// Replace whatever was queued.  Newest wins: an older queued URL is one the
-/// user has already typed past, and loading it would only show them a page they
-/// no longer asked for.
-#[cfg(not(target_os = "windows"))]
-fn queue_pending(slot: &Arc<Mutex<Option<String>>>, url: &str) {
-    if let Ok(mut g) = slot.lock() {
-        *g = Some(url.to_owned());
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn take_pending(slot: &Arc<Mutex<Option<String>>>) -> Option<String> {
-    slot.lock().ok().and_then(|mut g| g.take())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn has_pending(slot: &Arc<Mutex<Option<String>>>) -> bool {
-    slot.lock().map(|g| g.is_some()).unwrap_or(false)
-}
-
-/// What the load task does after finishing one navigation: the next URL to
-/// navigate, or `None` to end the chain and let the flag go.
-///
-/// The double take is not redundant.  Between the first take and clearing
-/// `load_inflight`, a commit still sees the flag set, so it queues instead of
-/// spawning — and would then wait for a task that is already exiting.  The
-/// second take catches exactly that request and claims the flag back for it.
-/// If the swap finds the flag already taken, a later commit won it and spawned
-/// its own task for a newer URL, so the one we pulled out is stale: dropping it
-/// is the same newest-wins rule `queue_pending` applies.
-#[cfg(not(target_os = "windows"))]
-fn next_target(inflight: &AtomicBool, pending: &Arc<Mutex<Option<String>>>) -> Option<String> {
-    if let Some(next) = take_pending(pending) {
-        return Some(next);
-    }
-    inflight.store(false, Ordering::Release);
-    let next = take_pending(pending)?;
-    (!inflight.swap(true, Ordering::AcqRel)).then_some(next)
-}
-
-// ---------------------------------------------------------------------------
-// Async helpers for the persistent live session
-// ---------------------------------------------------------------------------
-
-/// Run one navigation to completion and publish its result, reusing the live
-/// session or creating it first.
-///
-/// Publishing is skipped when a newer URL is already queued: its content would
-/// flash on screen under the newer URL's bar before being replaced a moment
-/// later.  The chain always ends with a publish, because the loop only stops
-/// once the queue is empty.
-#[cfg(not(target_os = "windows"))]
-async fn navigate_once(
-    live: &Arc<tokio::sync::Mutex<Option<LivePageSession>>>,
-    ready: &ReadySlot,
-    errors: &Arc<Mutex<Option<String>>>,
-    pending: &Arc<Mutex<Option<String>>>,
-    url: &str,
-) {
-    let mut guard = live.lock().await;
-    if guard.is_none() {
-        match init_live_session().await {
-            Ok(session) => *guard = Some(session),
-            Err(e) => {
-                drop(guard);
-                if !has_pending(pending) {
-                    publish_load_failure(ready, errors, format!("Error launching browser: {e}"));
-                }
-                return;
-            }
-        }
-    }
-    let page = guard.as_ref().expect("initialised above").page.clone();
-    // Release the session lock across the navigation so a cleanup or cookie
-    // clear is not blocked behind a slow page.
-    drop(guard);
-
-    let outcome = navigate_and_get_html(&page, url).await;
-    if outcome.is_err() {
-        // Drop the session so the next attempt starts fresh.
-        *live.lock().await = None;
-    }
-    if has_pending(pending) {
-        return;
-    }
-    match outcome {
-        Ok(load) => {
-            let (elements, form_map) = page_to_ffon_with_forms(&load, url);
-            if let Ok(mut g) = ready.lock() {
-                *g = Some((elements, form_map));
-            }
-        }
-        Err(e) => publish_load_failure(ready, errors, format!("Error loading {url}: {e}")),
-    }
-}
-
-/// Initialise a long-lived Chrome session: launch the browser, open a blank
-/// tab, and inject the stealth script so it applies to every page load.
-///
-/// Non-Windows only.  Windows uses `fetch_html_once` for each page load so the
-/// off-screen Chrome window is never present while the user reads the page.
-#[cfg(not(target_os = "windows"))]
-async fn init_live_session() -> Result<LivePageSession, String> {
-    let t = tokio::time::Duration::from_secs;
-    let session = launch_browser().await?;
-    let page = tokio::time::timeout(t(15), session.browser.new_page("about:blank"))
-        .await
-        .map_err(|_| "Chrome took >15 s to open a tab".to_owned())?
+/// Open the live session: launch Chrome, open a tab, and inject the stealth
+/// script so it applies to every page load.
+fn init_live_session() -> Result<LiveSession, String> {
+    let mut chrome = launch_browser()?;
+    let page = chrome
+        .new_page()
         .map_err(|e| format!("failed to open tab: {e}"))?;
-    tokio::time::timeout(
-        t(10),
-        page.execute(AddScriptToEvaluateOnNewDocumentParams::new(STEALTH_SCRIPT)),
-    )
-    .await
-    .map_err(|_| "stealth script injection timed out".to_owned())?
-    .map_err(|e| format!("stealth script injection failed: {e}"))?;
-    set_desktop_viewport(&page).await;
-    Ok(LivePageSession { session, page })
+    chrome
+        .add_script_on_new_document(&page, STEALTH_SCRIPT)
+        .map_err(|e| format!("stealth script injection failed: {e}"))?;
+    chrome.set_desktop_viewport(&page);
+    Ok(LiveSession { chrome, page })
 }
 
-/// Navigate an existing page to `url` and return the settled HTML.
-/// Mirrors the logic of the old `fetch_page` but reuses the caller's tab.
-async fn navigate_and_get_html(page: &chromiumoxide::Page, url: &str) -> Result<PageLoad, String> {
-    let t = tokio::time::Duration::from_secs;
+/// Navigate the tab to `url` and return the settled page.
+fn navigate_and_get_html(
+    chrome: &mut cdp::Chrome,
+    page: &cdp::Page,
+    url: &str,
+) -> Result<PageLoad, String> {
+    chrome.goto(page, url, secs(30)).map_err(|e| {
+        if e.starts_with("navigation to") {
+            e
+        } else {
+            format!("navigation to {url} failed: {e}")
+        }
+    })?;
 
-    tokio::time::timeout(t(30), page.goto(url))
-        .await
-        .map_err(|_| format!("navigation to {url} timed out after 30 s"))?
-        .map_err(|e| format!("navigation to {url} failed: {e}"))?;
-
-    let current_url = await_stable_url(page, t(5)).await;
+    let current_url = await_stable_url(chrome, page, secs(5));
 
     // Read the page once up front.  Google/YouTube serve their GDPR wall inline
     // on a normal URL (www.google.com), so the URL alone does not reveal it; we
     // also sniff the fetched content for the consent-save endpoint.
-    let html = settled_html(page).await?;
+    let html = settled_html(chrome, page)?;
 
-    let (load, _) = settle_gates(page, &current_url, html).await;
+    let (load, _) = settle_gates(chrome, page, &current_url, html);
     Ok(load)
 }
 
 // ---------------------------------------------------------------------------
-// Windows close-after-load: per-call launch+fetch+close helpers
-//
-// On Windows the persistent off-screen Chrome window would be announced by
-// screen readers (NVDA / Narrator) via the UI Automation tree.  Instead we
-// launch a fresh Chrome for every page load and every form submit, then
-// close it again.  Cookies and localStorage survive via the fixed profile
-// dir (`%TEMP%/sicompass-chrome`).
+// Chrome, started from the browser task and kept off the user's screen
 // ---------------------------------------------------------------------------
 
-/// Launch a fresh Chrome, open a tab, inject stealth, navigate to `url`,
-/// fetch HTML, and close Chrome.  Used by `load_url` on Windows.
-#[cfg(target_os = "windows")]
-async fn fetch_html_once(url: &str) -> Result<PageLoad, String> {
-    let t = tokio::time::Duration::from_secs;
-    let session = launch_browser().await?;
-
-    let result: Result<PageLoad, String> = async {
-        let page = tokio::time::timeout(t(15), session.browser.new_page("about:blank"))
-            .await
-            .map_err(|_| "Chrome took >15 s to open a tab".to_owned())?
-            .map_err(|e| format!("failed to open tab: {e}"))?;
-
-        tokio::time::timeout(
-            t(10),
-            page.execute(AddScriptToEvaluateOnNewDocumentParams::new(STEALTH_SCRIPT)),
-        )
-        .await
-        .map_err(|_| "stealth script injection timed out".to_owned())?
-        .map_err(|e| format!("stealth script injection failed: {e}"))?;
-        set_desktop_viewport(&page).await;
-
-        navigate_and_get_html(&page, url).await
-    }
-    .await;
-
-    close_browser(&session).await;
-    result
+/// A running Chrome and the tab the user's pages load in.
+struct LiveSession {
+    chrome: cdp::Chrome,
+    page: cdp::Page,
 }
 
-/// Send `Browser.close` so Chrome exits cleanly (WebSocket close handshake
-/// completes) before the `BrowserSession` is dropped.  Mirrors the pattern in
-/// `fetch_html_inner`.
-///
-/// Also used by the browser tests on every platform: nothing kills the child on
-/// drop, so a test that opens a session and walks away leaves a Chrome (and its
-/// Xvfb) running until the machine is rebooted.
-#[cfg(any(target_os = "windows", test))]
-async fn close_browser(session: &BrowserSession) {
-    use chromiumoxide::cdp::browser_protocol::browser::CloseParams;
-    let _ = tokio::time::timeout(
-        tokio::time::Duration::from_millis(500),
-        session.browser.execute(CloseParams::default()),
-    )
-    .await;
-    // Chrome is gone now; reclaim the foreground for the app window so the
-    // screen reader re-focuses sicompass (the automatic "alt-tab back").
-    #[cfg(target_os = "windows")]
-    win_hide::restore_foreground(session.prev_foreground);
-}
-
-/// Poll `page.url()` until it stays the same for `settle` (or `total` elapses).
-/// Used after clicking submit to give the post-submit navigation time to land.
-///
-/// More reliable than a fixed-duration sleep because real navigations can
-/// arrive 200 ms or 4 s after the click depending on server roundtrip and
-/// client-side redirects.
-#[cfg(target_os = "windows")]
-async fn await_navigation_stable(
-    page: &chromiumoxide::Page,
-    total: tokio::time::Duration,
-    settle: tokio::time::Duration,
-) {
-    let poll = tokio::time::Duration::from_millis(200);
-    let deadline = tokio::time::Instant::now() + total;
-    let mut last_url = String::new();
-    let mut stable_since: Option<tokio::time::Instant> = None;
-    loop {
-        tokio::time::sleep(poll).await;
-        let url = tokio::time::timeout(tokio::time::Duration::from_secs(3), page.url())
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .flatten()
-            .unwrap_or_default();
-
-        if url != last_url {
-            last_url = url;
-            stable_since = Some(tokio::time::Instant::now());
-        } else if let Some(start) = stable_since {
-            if start.elapsed() >= settle {
-                return;
-            }
-        } else {
-            stable_since = Some(tokio::time::Instant::now());
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            return;
-        }
-    }
-}
-
-/// Top-level driver for the Windows submit thread.  Launches Chrome, runs the
-/// fill+submit+fetch flow, surfaces success or error through the shared slots,
-/// and closes Chrome on every exit path.
-#[cfg(target_os = "windows")]
-async fn submit_form_windows_async(
-    url: String,
-    form_n: usize,
-    stored_values: HashMap<String, String>,
-    ready: ReadySlot,
-    error_slot: Arc<Mutex<Option<String>>>,
-) {
-    let session = match launch_browser().await {
-        Ok(s) => s,
-        Err(e) => {
-            set_error(
-                &error_slot,
-                format!("Could not launch Chrome for submit: {e}"),
-            );
-            return;
-        }
-    };
-
-    let result = submit_form_windows_inner(&session, &url, form_n, &stored_values).await;
-    match result {
-        Ok((elements, form_map)) => {
-            if let Ok(mut guard) = ready.lock() {
-                *guard = Some((elements, form_map));
-            }
-        }
-        Err(e) => set_error(&error_slot, e),
-    }
-    close_browser(&session).await;
-}
-
-/// Inner submit flow: open a tab, navigate to `url`, drift-check the form,
-/// refill every stored value, click submit, await navigation, fetch the
-/// response page, and return its parsed FFON + new form map.
-///
-/// All errors are returned as `Err(String)` for the caller to push into
-/// `pending_error`.
-#[cfg(target_os = "windows")]
-async fn submit_form_windows_inner(
-    session: &BrowserSession,
-    url: &str,
-    form_n: usize,
-    stored_values: &HashMap<String, String>,
-) -> Result<(Vec<FfonElement>, FormMap), String> {
-    let t = tokio::time::Duration::from_secs;
-
-    let page = tokio::time::timeout(t(15), session.browser.new_page("about:blank"))
-        .await
-        .map_err(|_| "Chrome took >15 s to open a tab".to_owned())?
-        .map_err(|e| format!("failed to open tab: {e}"))?;
-
-    tokio::time::timeout(
-        t(10),
-        page.execute(AddScriptToEvaluateOnNewDocumentParams::new(STEALTH_SCRIPT)),
-    )
-    .await
-    .map_err(|_| "stealth script injection timed out".to_owned())?
-    .map_err(|e| format!("stealth script injection failed: {e}"))?;
-    set_desktop_viewport(&page).await;
-
-    // Re-navigate to the form URL.  Cookies from the profile dir come along.
-    let reopened = navigate_and_get_html(&page, url)
-        .await
-        .map_err(|e| format!("Failed to reopen {url} for submit: {e}"))?;
-
-    // Parse the fresh form so we can detect drift and look up the up-to-date
-    // submit selector (form structure may have changed since the user typed).
-    let (_fresh_elements, fresh_form_map) = html_to_ffon_with_forms(&reopened.html, url);
-
-    if let Err(missing) = check_form_drift(stored_values, &fresh_form_map) {
-        return Err(format!(
-            "Form changed since you started filling it: missing field(s) {}. \
-             Refresh the page and try again.",
-            missing.join(", ")
-        ));
-    }
-
-    // Refill every stored value via CDP.
-    for (form_key, value) in stored_values {
-        let Some(node) = fresh_form_map.get(form_key.as_str()) else {
-            // Drift check already passed; this branch only hits if the map
-            // changed under us between check and fill (impossible here).
-            continue;
-        };
-        let js = build_fill_js(
-            node.form_index,
-            node.match_index,
-            &node.css_selector,
-            value,
-            false,
-        );
-        tokio::time::timeout(t(5), page.evaluate(js))
-            .await
-            .map_err(|_| format!("Timed out filling field {form_key}"))?
-            .map_err(|e| format!("Failed to fill field {form_key}: {e}"))?;
-    }
-
-    // Locate the submit selector in the fresh form map; fall back to the
-    // generic `form:nth-of-type(N)` submit if the button isn't in the map.
-    let selector = fresh_form_map
-        .iter()
-        .find(|(key, node)| {
-            key.starts_with(&format!("form_{form_n}/")) && matches!(node.kind, FormNodeKind::Submit)
-        })
-        .map(|(_, node)| node.css_selector.clone())
-        .unwrap_or_else(|| html_submit_selector("", ""));
-
-    let click_js = format!(
-        "(() => {{ const el = document.querySelector({}); \
-         if (el) {{ el.click(); return true; }} \
-         const f = document.querySelector('form:nth-of-type({form_n})'); \
-         if (f) {{ f.submit(); return true; }} return false; }})()",
-        js_quote(&selector)
-    );
-    let _ = tokio::time::timeout(t(5), page.evaluate(click_js)).await;
-
-    // Give the post-submit navigation time to land.
-    await_navigation_stable(
-        &page,
-        tokio::time::Duration::from_secs(10),
-        tokio::time::Duration::from_millis(750),
-    )
-    .await;
-
-    // Fetch the response page.
-    let response_html = tokio::time::timeout(t(20), settled_html(&page))
-        .await
-        .map_err(|_| "timed out waiting for response page (20 s)".to_owned())??;
-
-    let response_url = tokio::time::timeout(t(5), page.url())
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .flatten()
-        .unwrap_or_else(|| url.to_owned());
-
-    // Answering one step leads to the next, so the response page goes through
-    // the chain exactly like a navigation does.
-    let (load, _) = settle_gates(&page, &response_url, response_html).await;
-    Ok(page_to_ffon_with_forms(&load, &response_url))
-}
-
-// ---------------------------------------------------------------------------
-// Chromium — per-fetch browser launch + shared async runtime
-// ---------------------------------------------------------------------------
-
-// Multi-thread runtime (2 workers) for chromiumoxide. Kept alive for the
-// process lifetime so repeated fetches reuse the same thread pool.
-static CHROMIUM_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-
-// ---------------------------------------------------------------------------
-// Windows: hide Chrome windows that appear during headed launch
-//
-// Chrome must run headed to pass bot-detection on sites like gva.be — headless
-// mode is fingerprinted and blocked.  On Linux, xvfb-run provides an invisible
-// X11 display.  On Windows we use Browser::launch (which chromiumoxide manages)
-// with `with_head()`, and a background thread that calls ShowWindow(SW_HIDE)
-// on any Chrome windows that appear while the browser is starting up.
-// The window is hidden within one paint frame (~50 ms) — invisible in practice.
-// user32.dll is always linked on Windows — no extra crates.
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Windows: keep Chrome windows off-screen (not hidden)
-//
-// We must never call ShowWindow(SW_HIDE) on Chrome windows.  Hiding a window
-// sends WM_SHOWWINDOW(FALSE) to Chrome's message loop, which drives
-// RenderWidget::SetHidden() inside Blink — this forces
-// document.visibilityState = "hidden" and kills JavaScript timer resolution
-// (React / consent-page apps never hydrate).  Moving the window to a position
-// far off all monitors keeps Chrome thinking the window is fully visible while
-// making it invisible to the user.  Chrome's JS runs at full speed.
-#[cfg(target_os = "windows")]
-mod win_hide {
-    unsafe extern "system" {
-        fn EnumWindows(
-            lp_enum_func: unsafe extern "system" fn(isize, isize) -> i32,
-            l_param: isize,
-        ) -> i32;
-        fn GetWindowThreadProcessId(hwnd: isize, lp_dw_process_id: *mut u32) -> u32;
-        fn IsWindowVisible(hwnd: isize) -> i32;
-        fn OpenProcess(dw_desired_access: u32, b_inherit_handle: i32, dw_process_id: u32) -> isize;
-        fn CloseHandle(h_object: isize) -> i32;
-        fn QueryFullProcessImageNameW(
-            h_process: isize,
-            dw_flags: u32,
-            lp_exe_name: *mut u16,
-            lp_size: *mut u32,
-        ) -> i32;
-        fn SetWindowPos(
-            hwnd: isize,
-            hwnd_insert_after: isize,
-            x: i32,
-            y: i32,
-            cx: i32,
-            cy: i32,
-            u_flags: u32,
-        ) -> i32;
-        fn GetForegroundWindow() -> isize;
-        fn SetForegroundWindow(hwnd: isize) -> i32;
-        fn BringWindowToTop(hwnd: isize) -> i32;
-        fn IsWindow(hwnd: isize) -> i32;
-        fn GetCurrentThreadId() -> u32;
-        fn AttachThreadInput(id_attach: u32, id_attach_to: u32, f_attach: i32) -> i32;
-        fn GetWindowLongPtrW(hwnd: isize, n_index: i32) -> isize;
-        fn SetWindowLongPtrW(hwnd: isize, n_index: i32, dw_new_long: isize) -> isize;
-    }
-
-    /// Index of the extended window styles in the window's memory.
-    const GWL_EXSTYLE: i32 = -20;
-    /// A window with this extended style does not become the foreground window
-    /// when clicked/created, so it cannot steal focus from the app.
-    const WS_EX_NOACTIVATE: isize = 0x0800_0000;
-
-    /// Mark `hwnd` non-activating so it never takes the foreground again. Applied
-    /// to each Chrome window the first time we see it; idempotent if reapplied.
-    fn set_no_activate(hwnd: isize) {
-        unsafe {
-            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            if ex & WS_EX_NOACTIVATE == 0 {
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE);
-            }
-        }
-    }
-
-    /// The current foreground window. Captured before Chrome launches so we know
-    /// which window (the sicompass app) to hand focus back to afterwards.
-    pub fn current_foreground() -> isize {
-        unsafe { GetForegroundWindow() }
-    }
-
-    /// Force `hwnd` back to the foreground.
-    ///
-    /// When the off-screen Chrome window is created it steals foreground focus,
-    /// so the screen reader follows it off into a web document (browse mode) and
-    /// stops tracking the sicompass window — exactly the "first arrow-down goes
-    /// silent until I alt-tab" symptom. After a page load/submit completes we
-    /// call this with the window captured by `current_foreground()` to do what
-    /// that manual alt-tab does: re-activate the app window so the screen reader
-    /// re-enters focus mode on it.
-    ///
-    /// Windows blocks `SetForegroundWindow` from a process that does not own the
-    /// current foreground window (foreground lock), so we briefly attach our
-    /// input queue to the foreground thread first — the standard workaround.
-    pub fn restore_foreground(hwnd: isize) {
-        if hwnd == 0 {
-            return;
-        }
-        unsafe {
-            if IsWindow(hwnd) == 0 {
-                return;
-            }
-            let fg = GetForegroundWindow();
-            if fg == hwnd {
-                return; // already focused — nothing stole it
-            }
-            let our_tid = GetCurrentThreadId();
-            let mut _pid: u32 = 0;
-            let fg_tid = if fg != 0 {
-                GetWindowThreadProcessId(fg, &mut _pid)
-            } else {
-                0
-            };
-            let attached =
-                fg_tid != 0 && fg_tid != our_tid && AttachThreadInput(our_tid, fg_tid, 1) != 0;
-            SetForegroundWindow(hwnd);
-            BringWindowToTop(hwnd);
-            if attached {
-                AttachThreadInput(our_tid, fg_tid, 0);
-            }
-        }
-    }
-
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    /// Do not resize the window.
-    const SWP_NOSIZE: u32 = 0x0001;
-    /// Do not change z-order.
-    const SWP_NOZORDER: u32 = 0x0004;
-    /// Do not activate/focus the window.
-    const SWP_NOACTIVATE: u32 = 0x0010;
-
-    /// Off-screen position: far beyond any realistic monitor layout.
-    const OFFSCREEN_X: i32 = -10_000;
-    const OFFSCREEN_Y: i32 = -10_000;
-
-    /// Collect all currently-visible top-level window handles.
-    pub fn snapshot_windows() -> Vec<isize> {
-        let mut hwnds: Vec<isize> = Vec::new();
-        unsafe extern "system" fn callback(hwnd: isize, lparam: isize) -> i32 {
-            let vec = unsafe { &mut *(lparam as *mut Vec<isize>) };
-            vec.push(hwnd);
-            1 // continue
-        }
-        unsafe { EnumWindows(callback, &mut hwnds as *mut Vec<isize> as isize) };
-        hwnds
-    }
-
-    /// Move every visible top-level Chrome/Edge window that was NOT present in
-    /// `before` to an off-screen position.  The window remains "visible" to
-    /// Chrome (no SW_HIDE, no occlusion) so JavaScript timers are never throttled.
-    ///
-    /// The first time each Chrome window is seen it is also marked
-    /// `WS_EX_NOACTIVATE` (so it can never take the foreground again) and the
-    /// foreground is handed straight back to `prev_foreground` (the app window).
-    /// Without this the newly-created Chrome window grabs the foreground on
-    /// creation, the screen reader follows it into a web document, and the app's
-    /// arrow keys stop working until the user alt-tabs back. `handled` carries
-    /// the set of windows already processed across the mover's 50 ms ticks so the
-    /// focus bounce fires once per window, not every tick.
-    pub fn hide_new_browser_windows(
-        before: &[isize],
-        handled: &mut Vec<isize>,
-        prev_foreground: isize,
-    ) {
-        let mut current: Vec<isize> = Vec::new();
-        unsafe extern "system" fn callback(hwnd: isize, lparam: isize) -> i32 {
-            let vec = unsafe { &mut *(lparam as *mut Vec<isize>) };
-            vec.push(hwnd);
-            1
-        }
-        unsafe { EnumWindows(callback, &mut current as *mut Vec<isize> as isize) };
-
-        let mut saw_new = false;
-        for hwnd in current {
-            if before.contains(&hwnd) {
-                continue;
-            }
-            if unsafe { IsWindowVisible(hwnd) } == 0 {
-                continue;
-            }
-
-            // Get the process ID for this window.
-            let mut pid: u32 = 0;
-            unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
-            if pid == 0 {
-                continue;
-            }
-
-            // Open the process to query its image name.
-            let h_proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-            if h_proc == 0 {
-                continue;
-            }
-
-            let mut buf = [0u16; 512];
-            let mut len = buf.len() as u32;
-            let ok = unsafe { QueryFullProcessImageNameW(h_proc, 0, buf.as_mut_ptr(), &mut len) };
-            unsafe { CloseHandle(h_proc) };
-
-            if ok == 0 {
-                continue;
-            }
-            let path = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
-            if path.contains("chrome") || path.contains("msedge") {
-                // Move off-screen without resizing, changing z-order, or
-                // activating.  Never hide — see module comment.
-                unsafe {
-                    SetWindowPos(
-                        hwnd,
-                        0,
-                        OFFSCREEN_X,
-                        OFFSCREEN_Y,
-                        0,
-                        0,
-                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                    );
-                }
-                if !handled.contains(&hwnd) {
-                    handled.push(hwnd);
-                    // Stop this window from ever taking the foreground again.
-                    set_no_activate(hwnd);
-                    saw_new = true;
-                }
-            }
-        }
-
-        // A Chrome window just appeared (and likely grabbed the foreground on
-        // creation). Hand focus straight back to the app so the screen reader
-        // re-acquires it — the programmatic equivalent of the user's alt-tab.
-        if saw_new {
-            restore_foreground(prev_foreground);
-        }
-    }
-}
-
-/// How Chrome is started on Linux.
-#[cfg(target_os = "linux")]
-enum LinuxChrome {
-    /// Path to a wrapper script that runs *headed* Chrome on an invisible
-    /// virtual X11 display. The preferred mode: headed Chrome passes the
-    /// bot-detection that fingerprints and blocks headless.
-    VirtualDisplay(std::path::PathBuf),
-    /// Path to the plain Chrome binary, to be launched in Chrome's own
-    /// headless mode because no virtual display is available on this machine.
-    /// Some sites block headless, but it is the only remaining way to keep
-    /// Chrome off the user's screen — see `linux_chrome_launch`.
-    Headless(std::path::PathBuf),
-}
-
-/// Which virtual-display helper is present on this machine.
-#[cfg(target_os = "linux")]
-enum XvfbHelper {
-    /// `xvfb-run` — the standard wrapper; it allocates a display and cleans up.
-    Run,
-    /// Bare `Xvfb`, without the `xvfb-run` wrapper (e.g. some Nix setups).
-    Bare,
-}
-
-/// An AT-SPI bus address that deliberately points at nothing.
-///
-/// Xvfb keeps Chrome off the user's *screen*, but the accessibility bus is
-/// per-session, not per-display. A Chrome started on an invisible display still
-/// registers itself on it, so with Orca running the user gets a second
-/// application named "Google Chrome" carrying a window titled after the page
-/// they just opened. The screen reader then has somewhere else to go, and the
-/// arrow keys stop driving sicompass. Chrome only does this while an assistive
-/// technology is actually running, which is why the app looks fine until a
-/// screen reader is switched on.
-///
-/// Chrome resolves the a11y bus from `AT_SPI_BUS_ADDRESS` before falling back
-/// to the session bus, so aiming that at a socket that cannot exist makes the
-/// connection fail and keeps Chrome off the bus entirely. It is the only lever
-/// that works here: `NO_AT_BRIDGE` is a GTK variable Chrome does not read, and
-/// `--disable-renderer-accessibility` only trims the renderer's tree while the
-/// browser process still registers.
-#[cfg(target_os = "linux")]
-const NO_AT_SPI_BUS: &str = "unix:path=/nonexistent/sicompass-keeps-chrome-off-the-a11y-bus";
-
-/// Environment overrides for every Chrome sicompass starts on Linux.
-///
-/// Split out from `launch_browser` so the invariant the fix rests on — that the
-/// address cannot resolve — is testable without launching a browser.
-#[cfg(target_os = "linux")]
-fn offscreen_chrome_env() -> [(&'static str, &'static str); 1] {
-    [("AT_SPI_BUS_ADDRESS", NO_AT_SPI_BUS)]
-}
-
-/// The shell script that starts Chrome on an invisible X11 display.
-///
-/// Split out from `linux_chrome_launch` so the generated script can be tested
-/// without an actual Xvfb on the machine running the tests.
-#[cfg(target_os = "linux")]
-fn xvfb_wrapper_script(chrome: &str, helper: XvfbHelper) -> String {
-    match helper {
-        // The trailing `1>&2` is what makes this work at all on Debian and its
-        // derivatives. Their xvfb-run runs the command as
-        // `DISPLAY=… "$@" 2>&1`, folding Chrome's stderr into stdout, and
-        // chromiumoxide launches Chrome with stdout on /dev/null and only
-        // stderr on a pipe, which it scans for "DevTools listening on ws://…".
-        // Without the redirect that line lands in /dev/null, chromiumoxide
-        // waits out its full launch timeout and reports
-        // `LaunchTimeout(BrowserStderr(""))` while a perfectly healthy Chrome
-        // sits on the virtual display. Sending our stdout to stderr puts the
-        // line back where chromiumoxide is listening. Nixpkgs' xvfb-run has no
-        // `2>&1`, so there the redirect only moves Chrome's (empty) stdout, and
-        // this is why the bug never showed up in the dev shell.
-        //
-        // `-s "-screen …"` is not optional. Without it xvfb-run uses its own
-        // default screen, which on this toolchain came out at 612x459 — Chrome
-        // clamps `--window-size=1920,1080` to the screen, the viewport lands at
-        // 800px, and every responsive site serves its *phone* layout. bpost
-        // then hides its desktop navigation entirely and moves "Pakje
-        // verzenden", "Pakje ontvangen" and the service tiles into a hamburger
-        // menu, so the page read nothing like the one in a normal browser.
-        XvfbHelper::Run => format!(
-            "#!/bin/sh\nunset WAYLAND_DISPLAY\nexec xvfb-run -a -s \"-screen 0 {VIEWPORT_W}x{VIEWPORT_H}x24\" {chrome} --ozone-platform=x11 \"$@\" 1>&2\n"
-        ),
-        // Emulate xvfb-run: pick a free display number, start Xvfb on it, run
-        // Chrome (backgrounded so we keep the shell alive), and kill both Xvfb
-        // and Chrome on any exit signal. Chrome inherits our stdout/stderr, so
-        // chromiumoxide still reads its "DevTools listening on ws://…" line.
-        XvfbHelper::Bare => format!(
-            "#!/bin/sh\n\
-             unset WAYLAND_DISPLAY\n\
-             d=99\n\
-             while [ -e /tmp/.X${{d}}-lock ] || [ -e /tmp/.X11-unix/X${{d}} ]; do d=$((d+1)); done\n\
-             Xvfb :$d -screen 0 {VIEWPORT_W}x{VIEWPORT_H}x24 -nolisten tcp >/dev/null 2>&1 &\n\
-             xp=$!\n\
-             i=0\n\
-             while [ ! -e /tmp/.X11-unix/X${{d}} ]; do i=$((i+1)); [ $i -ge 100 ] && break; sleep 0.05; done\n\
-             DISPLAY=:$d {chrome} --ozone-platform=x11 \"$@\" &\n\
-             cp=$!\n\
-             trap 'kill $cp $xp 2>/dev/null' EXIT HUP INT TERM\n\
-             wait $cp\n"
-        ),
-    }
-}
-
-/// Decide how Chrome will be started on Linux, so that it is never visible on
-/// the user's screen.
-///
-/// Preference order:
-/// 1. `xvfb-run -a` — headed Chrome on a virtual display. Best compatibility:
-///    the browser is a normal headed Chrome as far as any website can tell.
-/// 2. Bare `Xvfb` — same thing, with the `xvfb-run` logic inlined into our own
-///    wrapper script, for systems that ship `Xvfb` without the wrapper.
-/// 3. Neither present — Chrome's own headless mode.
-///
-/// Step 3 exists because most desktop distributions (Mint, Ubuntu, Debian,
-/// Fedora, …) do not install Xvfb by default, so a released build lands there
-/// on a normal user's machine while a dev build inside `nix develop` takes
-/// step 1. Launching plain headed Chrome there would put a real window on the
-/// screen that takes the keyboard focus, and the screen reader follows it out
-/// of sicompass. Headless risks being blocked by a few bot-detecting sites;
-/// stealing focus from a screen-reader user breaks the whole app. Installing
-/// `xvfb` restores step 1, which is why the .deb and .rpm depend on it.
-#[cfg(target_os = "linux")]
-fn linux_chrome_launch() -> Result<LinuxChrome, String> {
-    let chrome = find_chrome_executable().ok_or_else(chrome_missing_message)?;
-    linux_chrome_launch_with(detect_xvfb_helper(), chrome)
-}
-
-/// Which of the two virtual-display helpers this machine has, if either.
-#[cfg(target_os = "linux")]
-fn detect_xvfb_helper() -> Option<XvfbHelper> {
-    if which::which("xvfb-run").is_ok() {
-        Some(XvfbHelper::Run)
-    } else if which::which("Xvfb").is_ok() {
-        Some(XvfbHelper::Bare)
-    } else {
-        None
-    }
-}
-
-/// The decision half of `linux_chrome_launch`, with the machine probe passed
-/// in so a test can exercise the no-Xvfb path on a machine that has Xvfb (and
-/// the reverse).
-#[cfg(target_os = "linux")]
-fn linux_chrome_launch_with(
-    helper: Option<XvfbHelper>,
-    chrome: std::path::PathBuf,
-) -> Result<LinuxChrome, String> {
-    let Some(helper) = helper else {
-        return Ok(LinuxChrome::Headless(chrome));
-    };
-
-    let script = xvfb_wrapper_script(&chrome.to_string_lossy(), helper);
-    let wrapper = std::env::temp_dir().join("sicompass-xvfb-chrome.sh");
-    std::fs::write(&wrapper, &script).map_err(|e| format!("failed to write Xvfb wrapper: {e}"))?;
-    #[cfg(unix)]
+/// Where Chrome keeps its profile, so cookies and logins survive restarts:
+/// `(folder, profile name in it)`. The folder is Chrome's working directory
+/// and the profile path is relative to it, because Chrome runs outside the
+/// sandbox: the host maps `/storage/...` onto the plugin's real storage
+/// folder for the working directory, which is the only path it translates.
+/// Natively (the live tests) a throwaway folder per run.
+fn chrome_profile() -> (String, &'static str) {
+    #[cfg(target_arch = "wasm32")]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755));
+        (format!("{}/chrome", sicompass_pdk::STORAGE_DIR), "profile")
     }
-    Ok(LinuxChrome::VirtualDisplay(wrapper))
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let dir = std::env::temp_dir().join(format!("sicompass-webbrowser-{}", std::process::id()));
+        (dir.to_string_lossy().into_owned(), "profile")
+    }
 }
 
-fn chromium_runtime() -> &'static tokio::runtime::Runtime {
-    CHROMIUM_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("failed to build chromium tokio runtime")
+/// Start Chrome on the persistent profile, clearing a stale lock a crashed
+/// Chrome left behind.
+fn launch_browser() -> Result<cdp::Chrome, String> {
+    let chrome = cdp::find_chrome().ok_or_else(cdp::chrome_missing_message)?;
+    let (parent, name) = chrome_profile();
+    let profile = std::path::Path::new(&parent).join(name);
+    let _ = std::fs::create_dir_all(&profile);
+    let _ = std::fs::remove_file(profile.join("SingletonLock"));
+    cdp::Chrome::launch(&cdp::Launch {
+        chrome,
+        profile_parent: &parent,
+        profile: name,
     })
-}
-
-/// Locate a usable Chrome/Chromium/Edge executable.
-///
-/// Priority:
-/// 1. `SICOMPASS_CHROME_PATH` environment variable
-/// 2. Common binary names on `PATH` (works on Linux; unlikely on Windows/macOS)
-/// 3. Well-known installation paths for the current OS
-fn find_chrome_executable() -> Option<std::path::PathBuf> {
-    // 1. Explicit override
-    if let Ok(p) = std::env::var("SICOMPASS_CHROME_PATH") {
-        let pb = std::path::PathBuf::from(p);
-        if pb.exists() {
-            return Some(pb);
-        }
-    }
-
-    // 2. PATH lookup (reliable on Linux; included here for all platforms)
-    const PATH_CANDIDATES: &[&str] = &[
-        "google-chrome",
-        "google-chrome-stable",
-        "google-chrome-beta",
-        "chromium",
-        "chromium-browser",
-        "chrome",
-    ];
-    if let Some(p) = PATH_CANDIDATES.iter().find_map(|n| which::which(n).ok()) {
-        return Some(p);
-    }
-
-    // 3. Well-known installation locations
-    #[cfg(target_os = "windows")]
-    {
-        let env_candidates: &[(&str, &str)] = &[
-            ("ProgramFiles", r"Google\Chrome\Application\chrome.exe"),
-            ("ProgramFiles", r"Chromium\Application\chrome.exe"),
-            ("ProgramFiles", r"Microsoft\Edge\Application\msedge.exe"),
-            ("ProgramFiles(x86)", r"Google\Chrome\Application\chrome.exe"),
-            ("ProgramFiles(x86)", r"Chromium\Application\chrome.exe"),
-            (
-                "ProgramFiles(x86)",
-                r"Microsoft\Edge\Application\msedge.exe",
-            ),
-            ("LocalAppData", r"Google\Chrome\Application\chrome.exe"),
-        ];
-        for (env, rel) in env_candidates {
-            if let Ok(base) = std::env::var(env) {
-                let full = std::path::PathBuf::from(base).join(rel);
-                if full.exists() {
-                    return Some(full);
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        const FIXED: &[&str] = &[
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        ];
-        for p in FIXED {
-            let pb = std::path::PathBuf::from(p);
-            if pb.exists() {
-                return Some(pb);
-            }
-        }
-        // ~/Applications
-        if let Ok(home) = std::env::var("HOME") {
-            let p = std::path::PathBuf::from(&home)
-                .join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-
-    None
-}
-
-/// The bundle names `chrome_on_mounted_image` looks for on a mounted volume.
-#[cfg(target_os = "macos")]
-const MAC_BROWSER_BUNDLES: &[&str] = &[
-    "Google Chrome.app",
-    "Google Chrome Canary.app",
-    "Chromium.app",
-    "Microsoft Edge.app",
-];
-
-/// A browser sitting in its mounted `.dmg`, downloaded but never installed.
-///
-/// This is the common macOS half-install: the disk image is still mounted and
-/// the browser gets launched from the installer window, so it *looks* installed
-/// while `/Applications` stays empty. We deliberately do not drive it from
-/// there — the volume is read-only and quarantined, Gatekeeper's App
-/// Translocation gives the bundle a randomised path that changes per launch,
-/// and ejecting the image pulls the browser out from under us mid-session. It
-/// is worth detecting only so the error can say what to do about it.
-#[cfg(target_os = "macos")]
-fn chrome_on_mounted_image() -> Option<std::path::PathBuf> {
-    for vol in std::fs::read_dir("/Volumes").ok()?.flatten() {
-        for bundle in MAC_BROWSER_BUNDLES {
-            let p = vol.path().join(bundle);
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
-
-/// Why no browser could be found, in terms of what the user should do next.
-fn chrome_missing_message() -> String {
-    #[cfg(target_os = "macos")]
-    if let Some(dmg) = chrome_on_mounted_image() {
-        return format!(
-            "{} is on a mounted disk image, not installed. In Finder, drag it \
-             from the disk image window into Applications, eject the image, \
-             then try again.",
-            dmg.display()
-        );
-    }
-    "Chrome/Chromium not found. \
-     Install Chrome or set SICOMPASS_CHROME_PATH to the browser executable."
-        .to_owned()
-}
-
-// ── BrowserSession ───────────────────────────────────────────────────────────
-// Owns the Browser handle; chromiumoxide manages the Chrome process lifetime.
-// On Windows, also owns the hider-thread stop signal: dropping it shuts the
-// thread down (channel disconnects → thread exits its recv_timeout loop).
-
-struct BrowserSession {
-    browser: Browser,
-    /// Windows only: dropping this signals the window-hider thread to stop.
-    #[cfg(target_os = "windows")]
-    _hider_stop: std::sync::mpsc::SyncSender<()>,
-    /// Windows only: the app window that was foreground before Chrome launched.
-    /// `close_browser` hands focus back to it so the screen reader returns to the
-    /// sicompass window rather than the off-screen Chrome window.
-    #[cfg(target_os = "windows")]
-    prev_foreground: isize,
-}
-
-// ── Platform-specific browser launch ─────────────────────────────────────────
-
-/// Persistent Chrome profile directory so cookies and logins survive restarts.
-/// Lives alongside the app's other config (e.g. `settings.json`) rather than in
-/// a temp dir that the OS wipes on reboot. Falls back to a temp dir only if no
-/// config home can be resolved.
-///
-/// The fallback carries the process id. Chrome refuses to open a user-data-dir
-/// that another process already holds, so a *fixed* fallback path meant two
-/// instances degrading to it would fight over one profile — and since
-/// `app_dir_name()` already separates a debug build from an installed one,
-/// running both at once is now an ordinary thing to do. A pid-scoped directory
-/// is disposable by definition here: this branch is the "no config home at all"
-/// degenerate case.
-fn chrome_profile_dir() -> std::path::PathBuf {
-    sicompass_sdk::platform::app_config_dir()
-        .map(|d| d.join("chrome-profile"))
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!(
-                "{}-chrome-{}",
-                sicompass_sdk::platform::app_dir_name(),
-                std::process::id()
-            ))
-        })
-}
-
-/// Linux: run Chrome headed on an invisible X11 display when Xvfb is available,
-/// and in Chrome's own headless mode when it is not. Either way, no Chrome
-/// window ever reaches the user's screen — see `linux_chrome_launch`.
-#[cfg(target_os = "linux")]
-async fn launch_browser() -> Result<BrowserSession, String> {
-    let launch = linux_chrome_launch()?;
-
-    // Persistent profile dir (see chrome_profile_dir) so cookies/logins survive
-    // restarts; also clean up any stale SingletonLock from a crashed launch.
-    let profile_dir = chrome_profile_dir();
-    let _ = std::fs::create_dir_all(&profile_dir);
-    let _ = std::fs::remove_file(profile_dir.join("SingletonLock"));
-
-    // `--headless=new` rather than the old headless mode: it is the same
-    // browser binary as headed Chrome, so the stealth script still has a real
-    // window.chrome and a full DOM to patch.
-    let (builder, exe, mode) = match launch {
-        LinuxChrome::VirtualDisplay(exe) => (BrowserConfig::builder().with_head(), exe, "xvfb"),
-        LinuxChrome::Headless(exe) => (
-            BrowserConfig::builder().new_headless_mode(),
-            exe,
-            "headless",
-        ),
-    };
-
-    // Keep this Chrome off the session's accessibility bus. Both launch modes
-    // need it: headed-on-Xvfb and Chrome's own headless mode each register as
-    // an application when an assistive technology is running — see
-    // `NO_AT_SPI_BUS`. The wrapper script passes its environment through, so
-    // setting it on the spawned process covers the Xvfb path too.
-    let config = builder
-        .envs(offscreen_chrome_env())
-        .arg("--disable-blink-features=AutomationControlled")
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .user_data_dir(&profile_dir)
-        .window_size(1920, 1080)
-        .chrome_executable(exe)
-        .build()
-        .map_err(|e| format!("chromium config error: {e}"))?;
-    let (browser, mut handler) = Browser::launch(config)
-        .await
-        .map_err(|e| format!("failed to launch Chrome ({mode}): {e}"))?;
-    tokio::spawn(async move { while handler.next().await.is_some() {} });
-    Ok(BrowserSession { browser })
-}
-
-/// Windows: launch headed Chrome positioned off-screen, with a background
-/// thread that moves any newly-visible Chrome windows off-screen every 50 ms.
-///
-/// We never call ShowWindow(SW_HIDE) — hiding a window sends WM_SHOWWINDOW
-/// to Chrome's message loop, driving RenderWidget::SetHidden(), which sets
-/// document.visibilityState = "hidden" and kills JS timer resolution.
-/// Instead we start Chrome with --window-position=-10000,-10000 and keep the
-/// mover thread running to catch any window that Chrome opens after launch.
-/// The thread stops automatically when `BrowserSession` is dropped.
-#[cfg(target_os = "windows")]
-async fn launch_browser() -> Result<BrowserSession, String> {
-    let exe = find_chrome_executable().ok_or_else(|| {
-        "Chrome/Chromium/Edge not found. \
-         Install Chrome or set SICOMPASS_CHROME_PATH to the browser executable."
-            .to_owned()
-    })?;
-
-    // Persistent profile dir (see chrome_profile_dir) so cookies/logins survive
-    // restarts; also clean up any stale SingletonLock from a crashed launch.
-    let profile_dir = chrome_profile_dir();
-    let _ = std::fs::create_dir_all(&profile_dir);
-    let _ = std::fs::remove_file(profile_dir.join("SingletonLock"));
-
-    let config = BrowserConfig::builder()
-        .with_head()
-        .arg("--disable-blink-features=AutomationControlled")
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        // Start the window far off all monitors so it is never on-screen.
-        // Negative coordinates are valid on Windows; the window is "visible"
-        // to Chrome (no SW_HIDE) so JS timers and rendering run at full speed.
-        .arg("--window-position=-10000,-10000")
-        // Belt-and-suspenders: also disable renderer backgrounding in case
-        // Chrome ever detects that its window is off all monitors.
-        .arg("--disable-backgrounding-occluded-windows")
-        .arg("--disable-renderer-backgrounding")
-        .arg("--disable-background-timer-throttling")
-        .user_data_dir(&profile_dir)
-        .window_size(1920, 1080)
-        .chrome_executable(&exe)
-        .build()
-        .map_err(|e| format!("chromium config error: {e}"))?;
-
-    // Snapshot existing windows before launch so we only target new ones.
-    let before = win_hide::snapshot_windows();
-
-    // Capture the current foreground window (the sicompass app) before Chrome
-    // exists, so `close_browser` can hand focus back to it — Chrome's window
-    // grabs the foreground when created, dragging the screen reader off with it.
-    let prev_foreground = win_hide::current_foreground();
-
-    // Channel: when stop_tx is dropped (BrowserSession dropped), recv_timeout
-    // returns Disconnected and the thread exits cleanly.
-    let (stop_tx, stop_rx) = std::sync::mpsc::sync_channel::<()>(0);
-
-    // Background mover: runs for the entire session lifetime.
-    // Moves any new Chrome windows off-screen (never hides them), marks them
-    // non-activating, and bounces focus back to the app the first time each one
-    // appears so the screen reader is never dragged off into Chrome.
-    std::thread::spawn(move || {
-        use std::sync::mpsc::RecvTimeoutError;
-        let mut handled: Vec<isize> = Vec::new();
-        loop {
-            match stop_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Err(RecvTimeoutError::Timeout) => {
-                    win_hide::hide_new_browser_windows(&before, &mut handled, prev_foreground);
-                }
-                _ => break, // Disconnected → BrowserSession dropped
-            }
-        }
-    });
-
-    let (browser, mut handler) = Browser::launch(config).await.map_err(|e| {
-        format!(
-            "failed to launch Chrome at {} — \
-         is Chrome installed? (set SICOMPASS_CHROME_PATH to override): {e}",
-            exe.display()
-        )
-    })?;
-    tokio::spawn(async move { while handler.next().await.is_some() {} });
-
-    Ok(BrowserSession {
-        browser,
-        _hider_stop: stop_tx,
-        prev_foreground,
-    })
-}
-
-/// macOS / other: Chrome in its own headless mode, so no window ever reaches
-/// the user's screen.
-///
-/// Headed Chrome here put a real window on screen and made it frontmost, which
-/// is the one thing this app cannot do: the screen reader follows the focus out
-/// of sicompass and the user's arrow keys go silent. The other two platforms
-/// each dodge that a different way — Linux runs headed Chrome on an Xvfb
-/// display, Windows parks the window at -10000,-10000 and hands focus back —
-/// and neither is available here. macOS has no virtual display, and
-/// `--window-position` does not help because launching still activates the app
-/// and puts it in the Dock, focus and all.
-///
-/// So this takes the same fallback Linux takes when Xvfb is missing, which is
-/// what most desktop Linux users already run. `--headless=new` rather than the
-/// old headless mode: it is the same browser binary as headed Chrome, so the
-/// stealth script still has a real `window.chrome` and a full DOM to patch.
-/// The cost is that a few bot-detecting sites are more likely to challenge us;
-/// that is a page that asks for a click, whereas stealing focus from a
-/// screen-reader user breaks the whole app.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-async fn launch_browser() -> Result<BrowserSession, String> {
-    let exe = find_chrome_executable().ok_or_else(chrome_missing_message)?;
-    // Persistent profile dir so cookies/logins survive restarts.
-    let profile_dir = chrome_profile_dir();
-    let _ = std::fs::create_dir_all(&profile_dir);
-    let _ = std::fs::remove_file(profile_dir.join("SingletonLock"));
-    let config = BrowserConfig::builder()
-        .new_headless_mode()
-        .arg("--disable-blink-features=AutomationControlled")
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .user_data_dir(&profile_dir)
-        .window_size(1920, 1080)
-        .chrome_executable(&exe)
-        .build()
-        .map_err(|e| format!("chromium config error: {e}"))?;
-    let (browser, mut handler) = Browser::launch(config).await.map_err(|e| {
-        format!(
-            "failed to launch Chrome at {} — \
-             is Chrome installed? (set SICOMPASS_CHROME_PATH to override): {e}",
-            exe.display()
-        )
-    })?;
-    tokio::spawn(async move { while handler.next().await.is_some() {} });
-    Ok(BrowserSession { browser })
 }
 
 // Full stealth script injected before every page load.
@@ -2973,7 +1656,6 @@ fn declared_languages(html: &str, url: &str) -> Vec<(String, String)> {
     // Reachable from the standalone `fetch_url_to_ffon` bridge as well as from
     // a live provider, so it cannot assume the provider registered the bundles.
     // Idempotent.
-    register_translations();
     let doc = scraper::Html::parse_document(html);
 
     let Ok(sel) = scraper::Selector::parse("link[rel][hreflang][href]") else {
@@ -3085,128 +1767,35 @@ fn page_to_ffon_with_forms(load: &PageLoad, url: &str) -> (Vec<FfonElement>, For
     (elements, form_map)
 }
 
-/// Fetch a URL via Chromium, parse the HTML, and return as FFON elements.
-/// Used by the main app's `fetch_url_to_elements` bridge.
-pub fn fetch_url_to_ffon(url: &str) -> Vec<FfonElement> {
-    if test_no_launch() {
-        return vec![FfonElement::new_str(format!(
-            "<test-no-launch>{url}</test-no-launch>"
-        ))];
-    }
-    match fetch_html_chromium(url) {
+/// Render `url` for a link another program shows, in a tab of its own in the
+/// live Chrome (so the reader's own tab stays where it is), and return it as
+/// FFON. The answer to the host's `sicompass:render-url`.
+fn render_page(chrome: &mut cdp::Chrome, url: &str) -> Vec<FfonElement> {
+    match fetch_page(chrome, url) {
         Ok(load) => page_to_ffon_with_forms(&load, url).0,
         Err(e) => vec![FfonElement::new_str(format!("Error loading {url}: {e}"))],
     }
 }
 
-fn fetch_html_chromium(url: &str) -> Result<PageLoad, String> {
-    chromium_runtime().block_on(async move {
-        tokio::time::timeout(tokio::time::Duration::from_secs(60), fetch_html_inner(url))
-            .await
-            .unwrap_or_else(|_| Err(format!("timed out loading {url} (60 s)")))
-    })
-}
-
-async fn fetch_html_inner(url: &str) -> Result<PageLoad, String> {
-    // Launch a fresh Chrome process for this fetch.
-    let session = launch_browser().await?;
-
-    // Do the actual page fetch.  Keeping result separate lets us close Chrome
-    // gracefully on both success and error paths before dropping the session.
-    let result = fetch_page(&session, url).await;
-
-    // Send Browser.close so Chrome exits cleanly (WebSocket close handshake
-    // completes) instead of being killed abruptly (which logs a spurious
-    // "ConnectionReset" error from the chromiumoxide handler task).
-    use chromiumoxide::cdp::browser_protocol::browser::CloseParams;
-    let _ = tokio::time::timeout(
-        tokio::time::Duration::from_millis(500),
-        session.browser.execute(CloseParams::default()),
-    )
-    .await;
-
-    // session dropped here; hider thread (Windows) and browser process stop.
-    result
-}
-
-/// Open a tab, navigate to `url`, and return the rendered HTML.
-/// Called by `fetch_html_inner` which handles Chrome lifecycle around it.
-async fn fetch_page(session: &BrowserSession, url: &str) -> Result<PageLoad, String> {
-    let t = tokio::time::Duration::from_secs;
-
-    let page = tokio::time::timeout(t(15), session.browser.new_page("about:blank"))
-        .await
-        .map_err(|_| "Chrome took >15 s to open a tab".to_owned())?
+/// Open a tab, navigate to `url`, and return the rendered page.
+fn fetch_page(chrome: &mut cdp::Chrome, url: &str) -> Result<PageLoad, String> {
+    let page = chrome
+        .new_page()
         .map_err(|e| format!("failed to open tab: {e}"))?;
-
-    tokio::time::timeout(
-        t(10),
-        page.execute(AddScriptToEvaluateOnNewDocumentParams::new(STEALTH_SCRIPT)),
-    )
-    .await
-    .map_err(|_| "stealth script injection timed out".to_owned())?
-    .map_err(|e| format!("stealth script injection failed: {e}"))?;
-    set_desktop_viewport(&page).await;
-
-    tokio::time::timeout(t(30), page.goto(url))
-        .await
-        .map_err(|_| format!("navigation to {url} timed out after 30 s"))?
-        .map_err(|e| format!("navigation to {url} failed: {e}"))?;
-
-    // Poll until the URL stabilises or a consent-wall URL is detected (up to 5 s).
-    // On Windows the JS redirect from the original page to the consent wall can
-    // fire well after Chrome's load event, so a single wait_for_navigation call
-    // (which may return before the redirect) is not reliable cross-platform.
-    let current_url = await_stable_url(&page, tokio::time::Duration::from_secs(5)).await;
-
-    // Read the page once up front so inline consent walls (Google/YouTube serve
-    // theirs on a normal URL) are visible via the content, not just the URL.
-    let html = settled_html(&page).await?;
-
-    // Surface any consent choice the page is showing, then hand the page over.
-    let (load, surfaced) = settle_gates(&page, &current_url, html).await;
-    if !surfaced && (is_consent_wall_str(&current_url) || html_has_consent_wall(&load.html)) {
-        // Capture a snippet to diagnose why no choice could be lifted out.
-        let snippet: String = load.html.chars().take(2000).collect();
-        eprintln!("=== consent-wall debug ===");
-        eprintln!("Consent URL : {current_url}");
-        eprintln!("Page snippet:\n{snippet}");
-        eprintln!("=== end consent-wall debug ===");
-    }
-
-    let _ = tokio::time::timeout(t(3), page.close()).await;
-
-    Ok(load)
+    let out = (|| {
+        chrome
+            .add_script_on_new_document(&page, STEALTH_SCRIPT)
+            .map_err(|e| format!("stealth script injection failed: {e}"))?;
+        chrome.set_desktop_viewport(&page);
+        navigate_and_get_html(chrome, &page, url)
+    })();
+    chrome.close_page(&page);
+    out
 }
 
 // ---------------------------------------------------------------------------
 // Hidden-content pruning
 // ---------------------------------------------------------------------------
-
-/// The viewport every page is rendered at.
-///
-/// Responsive sites pick their layout from this, so it decides whether the
-/// reader gets the desktop page or the phone one. Wide enough to clear the
-/// usual `xl` breakpoint (1200px) with room to spare.
-const VIEWPORT_W: u32 = 1920;
-const VIEWPORT_H: u32 = 1080;
-
-/// Force a desktop layout viewport, whatever the window or X screen happens to
-/// be. Belt and braces next to `--window-size`: headless defaults to 800x600,
-/// and under Xvfb the window is clamped to the virtual screen.
-async fn set_desktop_viewport(page: &chromiumoxide::Page) {
-    use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
-    let params = SetDeviceMetricsOverrideParams::builder()
-        .width(VIEWPORT_W as i64)
-        .height(VIEWPORT_H as i64)
-        .device_scale_factor(1.0)
-        .mobile(false)
-        .build();
-    if let Ok(params) = params {
-        let _ =
-            tokio::time::timeout(tokio::time::Duration::from_secs(5), page.execute(params)).await;
-    }
-}
 
 /// Serialise the document with every invisible subtree removed.
 ///
@@ -4072,14 +2661,11 @@ fn band_plan_js() -> String {
 ///
 /// Falls back to a plain `page.content()` whenever the in-page pass fails or
 /// runs long: a page that defeats the prune must still be readable.
-async fn settled_html(page: &chromiumoxide::Page) -> Result<String, String> {
-    let t = tokio::time::Duration::from_secs;
+fn settled_html(chrome: &mut cdp::Chrome, page: &cdp::Page) -> Result<String, String> {
     let pruned = if prune_hidden() {
-        tokio::time::timeout(t(10), page.evaluate(PRUNE_HIDDEN_SCRIPT.as_str()))
-            .await
+        chrome
+            .evaluate_as::<String>(page, PRUNE_HIDDEN_SCRIPT.as_str(), secs(10))
             .ok()
-            .and_then(|r| r.ok())
-            .and_then(|v| v.into_value::<String>().ok())
             .filter(|html| !html.is_empty())
     } else {
         None
@@ -4087,9 +2673,8 @@ async fn settled_html(page: &chromiumoxide::Page) -> Result<String, String> {
     if let Some(html) = pruned {
         return Ok(html);
     }
-    tokio::time::timeout(t(15), page.content())
-        .await
-        .map_err(|_| "timed out waiting for page content (15 s)".to_owned())?
+    chrome
+        .content(page, secs(15))
         .map_err(|e| format!("failed to get page content: {e}"))
 }
 
@@ -4523,7 +3108,6 @@ const CONSENT_BUTTON_PREFIX: &str = "sic-consent-";
 
 /// Build the in-page pass that finds the cookie decision and turns it into forms.
 fn gate_surface_js(google: Option<&GoogleConsent>, is_wall: bool, rebuild: bool) -> String {
-    register_translations();
     let containers = js_array(&CONSENT_BANNERS.iter().map(|(_, s)| *s).collect::<Vec<_>>());
     let cmp_sels = js_array(CMP_SELECTORS);
     let cmp_reject_sels = js_array(CMP_REJECT_SELECTORS);
@@ -4702,18 +3286,16 @@ fn gate_surface_js(google: Option<&GoogleConsent>, is_wall: bool, rebuild: bool)
 }
 
 /// Run the in-page pass once.
-async fn surface_gate(
-    page: &chromiumoxide::Page,
+fn surface_gate(
+    chrome: &mut cdp::Chrome,
+    page: &cdp::Page,
     google: Option<&GoogleConsent>,
     is_wall: bool,
     rebuild: bool,
 ) -> GateReport {
     let js = gate_surface_js(google, is_wall, rebuild);
-    tokio::time::timeout(tokio::time::Duration::from_secs(5), page.evaluate(js))
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .and_then(|r| r.into_value::<GateReport>().ok())
+    chrome
+        .evaluate_as::<GateReport>(page, &js, secs(5))
         .unwrap_or_default()
 }
 
@@ -4747,15 +3329,12 @@ fn gate_page_html(labels: &[String], ids: &[String]) -> String {
 ///
 /// Read back out of the live page rather than guessed, so a rebuild that
 /// renumbered the choices cannot leave the ids and the labels disagreeing.
-async fn gate_button_ids(page: &chromiumoxide::Page) -> Vec<String> {
+fn gate_button_ids(chrome: &mut cdp::Chrome, page: &cdp::Page) -> Vec<String> {
     let js = format!(
         r#"Array.from(document.querySelectorAll('button[id^="{CONSENT_BUTTON_PREFIX}"]')).map(b => b.id)"#
     );
-    tokio::time::timeout(tokio::time::Duration::from_secs(5), page.evaluate(js))
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .and_then(|r| r.into_value::<Vec<String>>().ok())
+    chrome
+        .evaluate_as::<Vec<String>>(page, &js, secs(5))
         .unwrap_or_default()
 }
 
@@ -4763,8 +3342,9 @@ async fn gate_button_ids(page: &chromiumoxide::Page) -> Vec<String> {
 ///
 /// Returns the page to render and whether it is a gate.  A gated page contains
 /// only the cookie choices; answering one leads to the content.
-async fn settle_gates(
-    page: &chromiumoxide::Page,
+fn settle_gates(
+    chrome: &mut cdp::Chrome,
+    page: &cdp::Page,
     current_url: &str,
     html: String,
 ) -> (PageLoad, bool) {
@@ -4774,7 +3354,6 @@ async fn settle_gates(
     if !prune_hidden() {
         return (PageLoad::plain(html), false);
     }
-    register_translations();
 
     let is_wall = is_consent_wall_str(current_url) || html_has_consent_wall(&html);
     let google = html_has_consent_wall(&html).then(|| google_consent_or_fallback(&html));
@@ -4784,9 +3363,9 @@ async fn settle_gates(
     // hydration lag the old auto-accept retried for.
     for attempt in 0..4u32 {
         if attempt > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(700)).await;
+            std::thread::sleep(std::time::Duration::from_millis(700));
         }
-        report = surface_gate(page, google.as_ref(), is_wall, attempt > 0).await;
+        report = surface_gate(chrome, page, google.as_ref(), is_wall, attempt > 0);
         // `pending` means the page may still be putting choices on screen:
         // a tag manager injecting the banner, or a CMP that has rendered
         // only one of its buttons so far.  It is read from the live DOM, so
@@ -4800,7 +3379,7 @@ async fn settle_gates(
     }
 
     if report.gated {
-        let ids = gate_button_ids(page).await;
+        let ids = gate_button_ids(chrome, page);
         if ids.len() == report.labels.len() {
             return (
                 PageLoad {
@@ -4816,7 +3395,7 @@ async fn settle_gates(
     // worth re-serialising if something moved — a banner container marked for
     // the prune to take out.
     let html = if report.marked || html_has_inline_consent_banner(&html) {
-        settled_html(page).await.unwrap_or(html)
+        settled_html(chrome, page).unwrap_or(html)
     } else {
         html
     };
@@ -4842,19 +3421,16 @@ async fn settle_gates(
 /// its minimum wait while the page is still rebuilding itself, and the page
 /// gets serialised with its content region half-built. Watching the document
 /// covers both an in-place re-render and a real navigation.
-async fn await_page_settled(page: &chromiumoxide::Page, budget: tokio::time::Duration) {
+fn await_page_settled(chrome: &mut cdp::Chrome, page: &cdp::Page, budget: std::time::Duration) {
     const PROBE: &str = "(function(){try{return document.readyState+'|'+document.body.innerText.length;}\
          catch(e){return 'x|0';}})()";
-    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = std::time::Instant::now() + budget;
     let mut prev = String::new();
     let mut quiet = 0u32;
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
-        let now = tokio::time::timeout(tokio::time::Duration::from_secs(3), page.evaluate(PROBE))
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .and_then(|v| v.into_value::<String>().ok())
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let now = chrome
+            .evaluate_as::<String>(page, PROBE, secs(3))
             .unwrap_or_default();
         if now.starts_with("complete") && now == prev && !now.is_empty() {
             quiet += 1;
@@ -4866,7 +3442,7 @@ async fn await_page_settled(page: &chromiumoxide::Page, budget: tokio::time::Dur
             quiet = 0;
         }
         prev = now;
-        if tokio::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= deadline {
             return;
         }
     }
@@ -4879,20 +3455,19 @@ async fn await_page_settled(page: &chromiumoxide::Page, budget: tokio::time::Dur
 /// `MIN_WAIT` has elapsed since the call started — this prevents returning
 /// prematurely before a slow JS redirect has had a chance to fire (a common
 /// problem on Windows where the redirect can arrive after the load event).
-async fn await_stable_url(page: &chromiumoxide::Page, budget: tokio::time::Duration) -> String {
-    const MIN_WAIT: tokio::time::Duration = tokio::time::Duration::from_millis(1500);
-    let poll_interval = tokio::time::Duration::from_millis(300);
-    let deadline = tokio::time::Instant::now() + budget;
-    let start = tokio::time::Instant::now();
+fn await_stable_url(
+    chrome: &mut cdp::Chrome,
+    page: &cdp::Page,
+    budget: std::time::Duration,
+) -> String {
+    const MIN_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+    let poll_interval = std::time::Duration::from_millis(300);
+    let deadline = std::time::Instant::now() + budget;
+    let start = std::time::Instant::now();
     let mut prev_url = String::new();
     loop {
-        tokio::time::sleep(poll_interval).await;
-        let url = tokio::time::timeout(tokio::time::Duration::from_secs(3), page.url())
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .flatten()
-            .unwrap_or_default();
+        std::thread::sleep(poll_interval);
+        let url = chrome.url(page).unwrap_or_default();
 
         if is_consent_wall_str(&url) {
             return url; // Consent wall detected — stop early
@@ -4900,7 +3475,7 @@ async fn await_stable_url(page: &chromiumoxide::Page, budget: tokio::time::Durat
         if url == prev_url && start.elapsed() >= MIN_WAIT {
             return url; // URL has stabilised after minimum wait
         }
-        if tokio::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= deadline {
             return url;
         }
         prev_url = url;
@@ -4931,130 +3506,6 @@ mod tests {
         guard
     }
 
-    // ---- Linux Chrome launch mode ----
-
-    // Without xvfb-run or Xvfb — the state of a stock Mint / Ubuntu / Fedora
-    // desktop, and of every released build outside `nix develop` — Chrome has
-    // to run headless. The old behaviour here was a visible Chrome window that
-    // stole the keyboard focus, and with it the screen reader.
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn no_xvfb_falls_back_to_headless_not_a_visible_window() {
-        let chrome = std::path::PathBuf::from("/usr/bin/google-chrome");
-        let launch = linux_chrome_launch_with(None, chrome.clone()).expect("decision");
-        match launch {
-            LinuxChrome::Headless(exe) => assert_eq!(exe, chrome),
-            LinuxChrome::VirtualDisplay(_) => panic!("no Xvfb present, cannot use one"),
-        }
-    }
-
-    // Both launch paths must agree on the screen size.
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn both_xvfb_paths_use_the_same_desktop_screen_size() {
-        let screen = format!("-screen 0 {VIEWPORT_W}x{VIEWPORT_H}x24");
-        for helper in [XvfbHelper::Run, XvfbHelper::Bare] {
-            let script = xvfb_wrapper_script("/usr/bin/google-chrome", helper);
-            assert!(
-                script.contains(&screen),
-                "a virtual screen smaller than the layout viewport makes every \
-                 responsive site serve its phone layout: {script}"
-            );
-        }
-        assert!(VIEWPORT_W >= 1200, "must clear the usual xl breakpoint");
-    }
-
-    // With a helper present, Chrome runs headed behind a wrapper script that
-    // owns the invisible display.
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn xvfb_present_runs_headed_behind_a_wrapper() {
-        for helper in [XvfbHelper::Run, XvfbHelper::Bare] {
-            let launch = linux_chrome_launch_with(
-                Some(helper),
-                std::path::PathBuf::from("/usr/bin/chromium"),
-            )
-            .expect("decision");
-            let LinuxChrome::VirtualDisplay(wrapper) = launch else {
-                panic!("a helper is present, so Chrome must run on a virtual display");
-            };
-            let script = std::fs::read_to_string(&wrapper).expect("wrapper written");
-            assert!(
-                script.starts_with("#!/bin/sh"),
-                "wrapper must be a shell script"
-            );
-            assert!(
-                script.contains("/usr/bin/chromium"),
-                "wrapper must run Chrome"
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn xvfb_run_script_hands_chrome_a_virtual_display() {
-        let script = xvfb_wrapper_script("/usr/bin/google-chrome", XvfbHelper::Run);
-        assert!(script.contains("/usr/bin/google-chrome"));
-        // The screen size is the whole ballgame for a responsive site. Left to
-        // its own default, xvfb-run gave a 612x459 screen, Chrome clamped its
-        // window to it, the viewport came out at 800px, and every site served
-        // its phone layout — bpost hid its desktop navigation completely.
-        assert!(
-            script.contains(&format!("-screen 0 {VIEWPORT_W}x{VIEWPORT_H}x24")),
-            "xvfb-run must be given a desktop screen size: {script}"
-        );
-        // Chrome must not pick the compositor over the virtual X11 display.
-        assert!(script.contains("unset WAYLAND_DISPLAY"));
-        assert!(script.contains("--ozone-platform=x11"));
-        // Debian's xvfb-run runs the command as `"$@" 2>&1`, so without this
-        // redirect Chrome's "DevTools listening on ws://…" line goes to the
-        // stdout chromiumoxide sends to /dev/null, and every page load on a
-        // .deb/.rpm machine dies with LaunchTimeout(BrowserStderr("")).
-        assert!(
-            script.trim_end().ends_with("1>&2"),
-            "xvfb-run's stdout must be folded into stderr, where chromiumoxide reads: {script}"
-        );
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn bare_xvfb_script_starts_and_tears_down_its_own_server() {
-        let script = xvfb_wrapper_script("/usr/bin/google-chrome", XvfbHelper::Bare);
-        assert!(script.contains("Xvfb :$d"), "must start its own X server");
-        assert!(
-            script.contains("DISPLAY=:$d /usr/bin/google-chrome"),
-            "Chrome must run against that server"
-        );
-        assert!(
-            script.contains("trap 'kill $cp $xp 2>/dev/null' EXIT HUP INT TERM"),
-            "both processes must be killed on exit"
-        );
-    }
-
-    /// Xvfb hides Chrome from the screen, not from the screen reader: the
-    /// accessibility bus is per-session, so an off-screen Chrome would still
-    /// register as a second "Google Chrome" application for Orca to wander
-    /// into, and the user's arrow keys would stop reaching sicompass. The fix
-    /// rests entirely on Chrome being unable to resolve the address below, so
-    /// that is what this pins.
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn offscreen_chrome_cannot_reach_the_accessibility_bus() {
-        let env = offscreen_chrome_env();
-        let (key, addr) = env[0];
-        assert_eq!(key, "AT_SPI_BUS_ADDRESS");
-
-        let path = addr
-            .strip_prefix("unix:path=")
-            .expect("must be a unix socket address so the connection simply fails");
-        assert!(
-            !std::path::Path::new(path).exists(),
-            "{path} exists, so Chrome could reach a real bus through it"
-        );
-        // An absolute path, or Chrome would resolve it against its own cwd.
-        assert!(path.starts_with('/'), "{path} must be absolute");
-    }
-
     // ---- html_to_ffon unit tests ----
 
     #[test]
@@ -5065,13 +3516,13 @@ mod tests {
         );
         let section = result
             .iter()
-            .find(|e| e.as_obj().map_or(false, |o| o.key == "Section"));
+            .find(|e| e.as_obj().is_some_and(|o| o.key == "Section"));
         assert!(section.is_some(), "h2 should become an Obj");
         let children = &section.unwrap().as_obj().unwrap().children;
         assert!(
             children
                 .iter()
-                .any(|c| c.as_str().map_or(false, |s| s.contains("Content"))),
+                .any(|c| c.as_str().is_some_and(|s| s.contains("Content"))),
             "paragraph should be a child of the heading, not a sibling"
         );
     }
@@ -5084,18 +3535,18 @@ mod tests {
         );
         let top = result
             .iter()
-            .find(|e| e.as_obj().map_or(false, |o| o.key == "Top"));
+            .find(|e| e.as_obj().is_some_and(|o| o.key == "Top"));
         assert!(top.is_some(), "h1 should be at the top level");
         let top_children = &top.unwrap().as_obj().unwrap().children;
         let sub = top_children
             .iter()
-            .find(|e| e.as_obj().map_or(false, |o| o.key == "Sub"));
+            .find(|e| e.as_obj().is_some_and(|o| o.key == "Sub"));
         assert!(sub.is_some(), "h2 should be a child of h1");
         let sub_children = &sub.unwrap().as_obj().unwrap().children;
         assert!(
             sub_children
                 .iter()
-                .any(|c| c.as_str().map_or(false, |s| s.contains("Leaf"))),
+                .any(|c| c.as_str().is_some_and(|s| s.contains("Leaf"))),
             "paragraph should be a child of h2"
         );
     }
@@ -5120,7 +3571,7 @@ mod tests {
             "https://example.com",
         );
         // Both headings survive as their own navigable nodes...
-        fn find_key<'a>(elems: &'a [FfonElement], key: &str) -> bool {
+        fn find_key(elems: &[FfonElement], key: &str) -> bool {
             elems.iter().any(|e| match e {
                 FfonElement::Obj(o) => o.key == key || find_key(&o.children, key),
                 _ => false,
@@ -5152,7 +3603,7 @@ mod tests {
         assert!(
             result
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s == "Hello world here")),
+                .any(|e| e.as_str() == Some("Hello world here")),
             "internal whitespace should be collapsed to single spaces"
         );
     }
@@ -5173,7 +3624,7 @@ mod tests {
         assert!(
             result
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.contains("Hello world")))
+                .any(|e| e.as_str().is_some_and(|s| s.contains("Hello world")))
         );
     }
 
@@ -5186,7 +3637,7 @@ mod tests {
         assert!(
             result
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key.contains("Title")))
+                .any(|e| e.as_obj().is_some_and(|o| o.key.contains("Title")))
         );
     }
 
@@ -5205,7 +3656,7 @@ mod tests {
         assert!(
             result
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.contains("visible")))
+                .any(|e| e.as_str().is_some_and(|s| s.contains("visible")))
         );
     }
 
@@ -5372,9 +3823,8 @@ mod tests {
             .filter(|o| o.key.starts_with("navigation"))
             .expect("nav should be wrapped in a navigation Obj");
         let found = nav.children.iter().any(|c| {
-            c.as_obj().map_or(false, |o| {
-                o.key.contains("<link>") && o.key.contains("Home")
-            })
+            c.as_obj()
+                .is_some_and(|o| o.key.contains("<link>") && o.key.contains("Home"))
         });
         assert!(
             found,
@@ -5397,7 +3847,7 @@ mod tests {
         let found = footer
             .children
             .iter()
-            .any(|c| c.as_str().map_or(false, |s| s.contains("Copyright")));
+            .any(|c| c.as_str().is_some_and(|s| s.contains("Copyright")));
         assert!(
             found,
             "footer children should render inside the footer Obj, got: {result:?}"
@@ -5412,9 +3862,8 @@ mod tests {
         );
         // Links inside <p> are now Obj elements with <link> in the key
         let found = result.iter().any(|e| {
-            e.as_obj().map_or(false, |o| {
-                o.key.contains("<link>") && o.key.contains("rust-lang.org")
-            })
+            e.as_obj()
+                .is_some_and(|o| o.key.contains("<link>") && o.key.contains("rust-lang.org"))
         });
         assert!(found, "link should be an Obj with <link> tag in key");
     }
@@ -5428,7 +3877,7 @@ mod tests {
         // Links inside <p> are now Obj elements with <link> in the key
         let found = result.iter().any(|e| {
             e.as_obj()
-                .map_or(false, |o| o.key.contains("example.com/page"))
+                .is_some_and(|o| o.key.contains("example.com/page"))
         });
         assert!(
             found,
@@ -5445,7 +3894,7 @@ mod tests {
         // The navigability pass enriches the generic "list" key from its items.
         let list = result
             .iter()
-            .find(|e| e.as_obj().map_or(false, |o| o.key.starts_with("list")));
+            .find(|e| e.as_obj().is_some_and(|o| o.key.starts_with("list")));
         assert!(list.is_some());
         let children = &list.unwrap().as_obj().unwrap().children;
         assert_eq!(children.len(), 2);
@@ -5461,7 +3910,7 @@ mod tests {
         );
         let list = result.iter().find(|e| {
             e.as_obj()
-                .map_or(false, |o| o.key.starts_with("ordered list"))
+                .is_some_and(|o| o.key.starts_with("ordered list"))
         });
         assert!(list.is_some());
         let children = &list.unwrap().as_obj().unwrap().children;
@@ -5477,7 +3926,7 @@ mod tests {
         );
         let row = result
             .iter()
-            .find(|e| e.as_str().map_or(false, |s| s.contains(" | ")));
+            .find(|e| e.as_str().is_some_and(|s| s.contains(" | ")));
         assert!(row.is_some());
         assert!(row.unwrap().as_str().unwrap().contains("A | B"));
     }
@@ -5490,7 +3939,7 @@ mod tests {
         );
         let img = result.iter().find(|e| {
             e.as_str()
-                .map_or(false, |s| s.contains("A diagram") && s.contains("[img]"))
+                .is_some_and(|s| s.contains("A diagram") && s.contains("[img]"))
         });
         assert!(img.is_some());
     }
@@ -5587,7 +4036,7 @@ mod tests {
         );
         let found = result.iter().any(|e| {
             e.as_obj()
-                .map_or(false, |o| o.key.contains("<link>#foo</link>"))
+                .is_some_and(|o| o.key.contains("<link>#foo</link>"))
         });
         assert!(
             found,
@@ -5603,7 +4052,7 @@ mod tests {
         );
         let heading = result
             .iter()
-            .find(|e| e.as_obj().map_or(false, |o| o.key.contains("Section")));
+            .find(|e| e.as_obj().is_some_and(|o| o.key.contains("Section")));
         assert!(heading.is_some(), "heading should exist: {result:?}");
         let key = &heading.unwrap().as_obj().unwrap().key;
         assert!(
@@ -5638,9 +4087,8 @@ mod tests {
         );
         // The list wrapper Obj (not an li) should carry the id tag.
         let list = result.iter().find(|e| {
-            e.as_obj().map_or(false, |o| {
-                o.key.contains("list") && o.key.contains("<id>things</id>")
-            })
+            e.as_obj()
+                .is_some_and(|o| o.key.contains("list") && o.key.contains("<id>things</id>"))
         });
         assert!(
             list.is_some(),
@@ -5669,7 +4117,7 @@ mod tests {
         // Should contain a link obj pointing to #foo
         let has_link = result.iter().any(|e| {
             e.as_obj()
-                .map_or(false, |o| o.key.contains("<link>#foo</link>"))
+                .is_some_and(|o| o.key.contains("<link>#foo</link>"))
         });
         assert!(has_link, "should have a navigable link to #foo: {result:?}");
         // Should contain an element tagged with <id>foo</id>
@@ -5947,7 +4395,7 @@ mod tests {
         assert!(
             elements[0]
                 .as_str()
-                .map_or(false, |s| s.contains("Cloudflare")),
+                .is_some_and(|s| s.contains("Cloudflare")),
             "notice should lead the page: {:?}",
             elements[0]
         );
@@ -5972,12 +4420,12 @@ mod tests {
         assert!(
             elements[0]
                 .as_str()
-                .map_or(false, |s| s.contains("Cookie-consent wall"))
+                .is_some_and(|s| s.contains("Cookie-consent wall"))
         );
         assert!(
             elements[1]
                 .as_str()
-                .map_or(false, |s| s.contains("Cloudflare"))
+                .is_some_and(|s| s.contains("Cloudflare"))
         );
     }
 
@@ -5986,7 +4434,9 @@ mod tests {
     #[test]
     #[ignore]
     fn test_chromium_fetches_real_cloudflare_site() {
-        let result = fetch_html_chromium("https://www.gva.be");
+        let mut live = init_live_session().expect("launch chrome");
+        let result = fetch_page(&mut live.chrome, "https://www.gva.be");
+        live.chrome.close();
         assert!(result.is_ok(), "fetch failed: {:?}", result.err());
         let load = result.unwrap();
         assert!(!load.html.is_empty(), "expected non-empty HTML from gva.be");
@@ -6082,21 +4532,28 @@ mod tests {
         );
     }
 
+    /// A page for the navigation the provider is on, as the browser task
+    /// answers it.
+    fn page_done(p: &WebbrowserProvider, text: &str, submitted: bool) -> worker::Done {
+        worker::Done::Page {
+            seq: p.nav_seq,
+            submitted,
+            page: worker::WirePage::new(&[FfonElement::new_str(text)], &FormMap::new()),
+        }
+    }
+
     #[test]
     fn provider_tick_drains_ready_content() {
         let mut p = WebbrowserProvider::new();
-        // Simulate a background thread delivering content.
-        {
-            let mut guard = p.ready_content.lock().unwrap();
-            *guard = Some((vec![FfonElement::new_str("result")], FormMap::new()));
-        }
+        // The browser task delivering content.
+        p.apply_done(page_done(&p, "result", false));
         assert!(p.tick(), "tick should return true when content is ready");
         assert!(
             p.cached_page
                 .as_ref()
                 .and_then(|c| c.elements.first())
                 .and_then(|e| e.as_str())
-                .map_or(false, |s| s == "result"),
+                == Some("result"),
             "cached_page should hold the delivered content"
         );
         // Second tick with no new content returns false.
@@ -6112,10 +4569,7 @@ mod tests {
             p.take_navigation_request().is_none(),
             "no request before the page has landed — the content isn't there to enter yet"
         );
-        {
-            let mut guard = p.ready_content.lock().unwrap();
-            *guard = Some((vec![FfonElement::new_str("body text")], FormMap::new()));
-        }
+        p.apply_done(page_done(&p, "body text", false));
         assert!(p.tick());
         assert_eq!(
             p.take_navigation_request(),
@@ -6127,7 +4581,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "windows"))]
     #[test]
     fn fetch_while_loading_keeps_the_url_bar_childless() {
         let mut p = WebbrowserProvider::new();
@@ -6137,7 +4590,7 @@ mod tests {
             url: "https://old.example".to_owned(),
             elements: vec![FfonElement::new_str("stale body")],
         });
-        p.load_inflight.store(true, Ordering::Release);
+        p.loading = true;
 
         let items = p.fetch();
         assert_eq!(items.len(), 2, "URL bar plus a status line: {items:?}");
@@ -6150,7 +4603,6 @@ mod tests {
         assert_eq!(items[1].as_str(), Some("Loading…"));
     }
 
-    #[cfg(not(target_os = "windows"))]
     #[test]
     fn browser_launch_failure_leaves_the_loading_state() {
         // A load that dies before Chrome is even up (no Chrome installed, launch
@@ -6160,14 +4612,13 @@ mod tests {
         let mut p = WebbrowserProvider::new();
         p.current_url = "https://example.com".to_owned();
         p.pending_enter_content = true;
-        p.load_inflight.store(true, Ordering::Release);
+        p.loading = true;
 
-        publish_load_failure(
-            &p.ready_content,
-            &p.pending_error,
-            "Error launching browser: Chrome/Chromium not found.".to_owned(),
-        );
-        p.load_inflight.store(false, Ordering::Release);
+        p.apply_done(worker::Done::Failed {
+            seq: p.nav_seq,
+            error: "Error launching browser: Chrome, Chromium or Edge was not found.".to_owned(),
+        });
+        assert!(!p.loading);
 
         assert!(
             p.tick(),
@@ -6180,9 +4631,9 @@ mod tests {
             .as_obj()
             .expect("URL bar gains the page as children");
         assert!(
-            body.children.iter().any(|e| e
-                .as_str()
-                .is_some_and(|s| s.contains("Chrome/Chromium not found"))),
+            body.children
+                .iter()
+                .any(|e| e.as_str().is_some_and(|s| s.contains("was not found"))),
             "the reason has to be readable in the page: {body:?}"
         );
         assert!(
@@ -6197,125 +4648,62 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "windows"))]
     #[test]
     fn url_committed_during_a_load_is_queued_not_dropped() {
-        // A load is already running (the flag set here is what `load_url` would
-        // have set), so committing a second URL must not spawn anything — it
-        // hands the destination to the running task instead. Before, it just
-        // updated the URL bar and returned, and the second page never loaded.
+        // A load is already running. Committing a second URL hands the
+        // destination to the browser task, which runs it after (or instead of)
+        // the first. Before the queue existed, the second page never loaded.
         let _flag = launch_flag_guard(false);
         let mut p = WebbrowserProvider::new();
-        p.load_inflight.store(true, Ordering::Release);
-
+        let (w, jobs, _answers) = worker::Worker::recording();
+        p.worker = Some(w);
+        p.load_url("https://first.example/");
         p.load_url("https://second.example/");
 
+        let sent: Vec<String> = jobs
+            .try_iter()
+            .filter_map(|j| match j {
+                worker::Job::Navigate { url, .. } => Some(url),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            take_pending(&p.pending_url).as_deref(),
-            Some("https://second.example/"),
-            "the URL has to reach the running task, or nothing ever loads it"
+            sent,
+            ["https://first.example/", "https://second.example/"],
+            "the URL has to reach the browser task, or nothing ever loads it"
         );
         assert_eq!(
             p.current_url, "https://second.example/",
             "the URL bar still shows where the user is going"
         );
-        assert!(
-            p.load_inflight.load(Ordering::Acquire),
-            "the first load is still running; the flag stays set so `fetch` \
-             keeps saying \"Loading…\""
-        );
+        assert!(p.loading, "fetch keeps saying \"Loading…\"");
     }
 
-    #[cfg(not(target_os = "windows"))]
     #[test]
-    fn queued_navigations_coalesce_to_the_newest() {
-        // Typing past a URL should not cost a page load for each one.
+    fn a_page_for_a_url_typed_past_is_never_shown() {
+        // Typing past a URL should not show its page when it lands late: the
+        // task skips a navigation queued behind a newer one (see `worker`),
+        // and an answer that was already on its way is dropped here, or it
+        // would be cached under the newer URL now in the URL bar.
         let _flag = launch_flag_guard(false);
         let mut p = WebbrowserProvider::new();
-        p.load_inflight.store(true, Ordering::Release);
+        let (w, _jobs, _answers) = worker::Worker::recording();
+        p.worker = Some(w);
         p.load_url("https://first.example/");
+        let first = page_done(&p, "first page", false);
         p.load_url("https://second.example/");
-        p.load_url("https://third.example/");
 
+        p.apply_done(first);
+        assert!(p.cached_page.is_none(), "the first page is stale");
+        assert!(p.loading, "still waiting for the second");
+        assert!(!p.tick());
+
+        p.apply_done(page_done(&p, "second page", false));
+        assert!(!p.loading);
         assert_eq!(
-            take_pending(&p.pending_url).as_deref(),
-            Some("https://third.example/")
+            p.cached_page.as_ref().and_then(|c| c.elements[0].as_str()),
+            Some("second page")
         );
-        assert_eq!(
-            take_pending(&p.pending_url),
-            None,
-            "one slot, not a backlog"
-        );
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn next_target_serves_the_queue_then_releases_the_flag() {
-        let inflight = AtomicBool::new(true);
-        let pending = Arc::new(Mutex::new(None));
-
-        queue_pending(&pending, "https://queued.example/");
-        assert_eq!(
-            next_target(&inflight, &pending).as_deref(),
-            Some("https://queued.example/"),
-            "a queued URL is the task's next destination"
-        );
-        assert!(
-            inflight.load(Ordering::Acquire),
-            "the chain continues, so the flag stays set and no second task spawns"
-        );
-
-        assert_eq!(
-            next_target(&inflight, &pending),
-            None,
-            "empty queue ends the chain"
-        );
-        assert!(
-            !inflight.load(Ordering::Acquire),
-            "and releases the flag, so the next commit spawns its own task"
-        );
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn a_load_superseded_mid_flight_does_not_publish() {
-        // `navigate_once` skips publishing when a newer URL is already queued.
-        // Without that, the old page's content would land in `ready_content`
-        // and `tick` would cache it under the newer URL now in the URL bar.
-        let pending = Arc::new(Mutex::new(None));
-        assert!(!has_pending(&pending));
-        queue_pending(&pending, "https://newer.example/");
-        assert!(
-            has_pending(&pending),
-            "the in-flight navigation can see that it has been superseded"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_browser_still_on_its_disk_image_is_named_in_the_error() {
-        // Chrome downloaded but never dragged to Applications: it launches from
-        // the mounted installer window, so the user has every reason to believe
-        // it is installed. "not found" is true but useless; the message has to
-        // say what to do. Only asserts the wording when this machine is in that
-        // state — the fixed half of the message is checked either way.
-        let msg = chrome_missing_message();
-        match chrome_on_mounted_image() {
-            Some(dmg) => {
-                assert!(
-                    msg.contains(&dmg.display().to_string()),
-                    "name the bundle we found: {msg}"
-                );
-                assert!(
-                    msg.contains("drag it") && msg.contains("Applications"),
-                    "and say how to install it: {msg}"
-                );
-            }
-            None => assert!(
-                msg.contains("SICOMPASS_CHROME_PATH"),
-                "otherwise fall back to the override hint: {msg}"
-            ),
-        }
     }
 
     #[test]
@@ -6323,10 +4711,7 @@ mod tests {
         // Content arriving without an armed URL navigation (a form submit
         // response) must not pull the cursor out of the form the user is in.
         let mut p = WebbrowserProvider::new();
-        {
-            let mut guard = p.ready_content.lock().unwrap();
-            *guard = Some((vec![FfonElement::new_str("results")], FormMap::new()));
-        }
+        p.apply_done(page_done(&p, "results", true));
         assert!(p.tick());
         assert!(p.take_navigation_request().is_none());
     }
@@ -6483,7 +4868,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "windows"))]
     #[test]
     fn fetch_keeps_history_visible_while_loading() {
         let _flag = launch_flag_guard(true);
@@ -6491,9 +4875,9 @@ mod tests {
         let mut p = history_provider(dir.path());
         p.commit_edit("", "https://a.invalid");
 
-        p.load_inflight.store(true, Ordering::Release);
+        p.loading = true;
         let items = p.fetch();
-        p.load_inflight.store(false, Ordering::Release);
+        p.loading = false;
 
         assert_eq!(
             items.len(),
@@ -7236,7 +5620,6 @@ mod tests {
         // unconditional local-FFON update isn't wiped by refresh_current_directory.
         use sicompass_sdk::ffon::FormNode;
         use sicompass_sdk::ffon::FormNodeKind;
-        use sicompass_sdk::provider::Provider;
 
         let mut p = WebbrowserProvider::new();
         // Build a minimal cached_page with a form field.
@@ -7373,33 +5756,10 @@ mod tests {
 
     #[test]
     fn take_error_drains_pending_error_once() {
-        use sicompass_sdk::provider::Provider;
         let mut p = WebbrowserProvider::new();
         set_error(&p.pending_error, "boom".to_owned());
         assert_eq!(p.take_error(), Some("boom".to_owned()));
         assert_eq!(p.take_error(), None, "second drain returns None");
-    }
-
-    // ---- Windows single-flight submit guard ----
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn single_flight_rejects_second_submit() {
-        use sicompass_sdk::provider::Provider;
-        use std::sync::atomic::Ordering;
-        let mut p = WebbrowserProvider::new();
-        // Simulate an in-flight submit so the next press takes the early-return path.
-        p.submit_in_flight.store(true, Ordering::SeqCst);
-        p.current_url = "https://example.com".to_owned();
-        p.on_button_press("submit:form_1");
-
-        let err = p
-            .take_error()
-            .expect("pending_error should carry single-flight message");
-        assert!(
-            err.contains("already in progress"),
-            "unexpected error message: {err}",
-        );
     }
 
     // Run with: cargo test -p sicompass-webbrowser -- --ignored
@@ -7883,28 +6243,16 @@ mod tests {
         );
     }
 
-    // ---- the leftover language preference ----
-
-    #[test]
-    fn the_stale_language_pref_is_looked_for_where_0_1_17_wrote_it() {
-        // Beside the profile dir, not inside it — that is where the old code
-        // put the file precisely so `clear cookies` would leave it alone. Get
-        // this wrong and the sweep quietly deletes nothing.
-        let profile = std::path::Path::new("/cfg/sicompass/chrome-profile");
-        assert_eq!(
-            stale_language_pref_in(profile),
-            std::path::PathBuf::from("/cfg/sicompass/webbrowser-language")
-        );
-    }
-
     #[test]
     fn clearing_cookies_never_touches_real_files_under_test() {
-        // `remove_stale_language_pref` is a real `remove_file`, and the command
-        // tests below invoke `clear cookies`. Without the same guard the URL
-        // history has, running the suite would delete the developer's own file.
+        // With no Chrome running, `clear cookies` removes the cookie files
+        // from the profile on disk, and the command tests below invoke it.
+        // Natively that profile is a throwaway under the temp folder, never
+        // the developer's own.
+        let (parent, _) = chrome_profile();
         assert!(
-            stale_language_pref_path().is_none(),
-            "the persistence guard must cover every file this provider removes"
+            std::path::Path::new(&parent).starts_with(std::env::temp_dir()),
+            "the profile the tests clear must be a throwaway: {parent}"
         );
         let mut p = WebbrowserProvider::new();
         let mut error = String::new();
@@ -7951,17 +6299,13 @@ mod tests {
     // ---- browser-backed tests (need Chrome; run with --ignored) ----
 
     /// Load an HTML fixture from a temp file through the real load path.
-    #[cfg(not(target_os = "windows"))]
     fn load_fixture(name: &str, html: &str) -> PageLoad {
         let path = std::env::temp_dir().join(name);
         std::fs::write(&path, html).expect("write fixture");
         let url = format!("file://{}", path.display());
-        let out = chromium_runtime().block_on(async {
-            let live = init_live_session().await.expect("launch chrome");
-            let out = navigate_and_get_html(&live.page, &url).await;
-            close_browser(&live.session).await;
-            out
-        });
+        let mut live = init_live_session().expect("launch chrome");
+        let out = navigate_and_get_html(&mut live.chrome, &live.page, &url);
+        live.chrome.close();
         let _ = std::fs::remove_file(&path);
         out.expect("fixture should load")
     }
@@ -7970,29 +6314,22 @@ mod tests {
     ///
     /// How the geometry passes get asserted on at all: they are browser-side
     /// JS, so the only way to see their decisions is to ask the page for them.
-    #[cfg(not(target_os = "windows"))]
     fn eval_fixture(name: &str, html: &str, js: &str) -> String {
         let path = std::env::temp_dir().join(name);
         std::fs::write(&path, html).expect("write fixture");
         let url = format!("file://{}", path.display());
-        let out = chromium_runtime().block_on(async {
-            let live = init_live_session().await.expect("launch chrome");
-            let _ = navigate_and_get_html(&live.page, &url).await;
-            let out = live
-                .page
-                .evaluate(js)
-                .await
-                .ok()
-                .and_then(|v| v.into_value::<String>().ok());
-            close_browser(&live.session).await;
-            out
-        });
+        let mut live = init_live_session().expect("launch chrome");
+        let _ = navigate_and_get_html(&mut live.chrome, &live.page, &url);
+        let out = live
+            .chrome
+            .evaluate_as::<String>(&live.page, js, secs(10))
+            .ok();
+        live.chrome.close();
         let _ = std::fs::remove_file(&path);
         out.expect("fixture should evaluate")
     }
 
     /// Stamp geometry over a fixture and read back `data-sic-g` for `selectors`.
-    #[cfg(not(target_os = "windows"))]
     fn geo_probe_js(selectors: &[&str]) -> String {
         [
             PRUNE_JS_HEAD,
@@ -8009,7 +6346,6 @@ mod tests {
     /// A page whose source order is the exact reverse of its visual order:
     /// flex `order` puts the footer first in the markup and last on screen.
     /// Nothing but geometry can tell you that.
-    #[cfg(not(target_os = "windows"))]
     const BAND_FIXTURE: &str = r#"<!DOCTYPE html><html><head><style>
         body{margin:0} .page{display:flex;flex-direction:column;width:1920px}
         .hdr{order:1;height:80px} .content{order:2;display:flex;height:900px}
@@ -8026,7 +6362,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn geometry_is_read_from_the_layout_chrome_already_did() {
         // The whole premise of the change: Chrome has already laid the page out,
         // and the numbers it computed disagree with source order. Source order
@@ -8064,7 +6399,6 @@ mod tests {
     }
 
     /// Roles the banding pass assigned, as `label => role`, in reading order.
-    #[cfg(not(target_os = "windows"))]
     fn band_roles(name: &str, html: &str) -> (Vec<(String, String)>, serde_json::Value) {
         let raw = eval_fixture(name, html, &band_plan_js());
         let plan: serde_json::Value =
@@ -8085,7 +6419,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn banding_reads_regions_in_the_order_they_are_laid_out() {
         // Source order is footer, content, header. The layout says header,
         // content, footer — and that is what the page must read as.
@@ -8119,7 +6452,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn banding_puts_the_page_in_reading_order_end_to_end() {
         // The same fixture through the real load path: landmarks in the HTML,
         // reading order in the FFON, and the article's heading must not have
@@ -8162,7 +6494,6 @@ mod tests {
 
     /// A fixed cookie strip written first in the source and painted over the
     /// bottom of the window.  It is an overlay, not the page's colophon.
-    #[cfg(not(target_os = "windows"))]
     const OVERLAY_FIXTURE: &str = r#"<!DOCTYPE html><html><head><style>
         body{margin:0}
         .cookie{position:fixed;bottom:0;left:0;width:1920px;height:120px}
@@ -8177,7 +6508,6 @@ mod tests {
 
     /// A page an author already marked up correctly, already in visual order.
     /// The pass must leave it completely alone.
-    #[cfg(not(target_os = "windows"))]
     const IDENTITY_FIXTURE: &str = r#"<!DOCTYPE html><html><head><style>
         body{margin:0} nav{height:80px} main{height:900px} footer{height:200px}
         </style></head><body>
@@ -8188,7 +6518,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn a_fixed_overlay_is_not_mistaken_for_the_footer() {
         // A cookie bar is painted over the bottom of the viewport, which is
         // exactly where a footer lives. Position alone would call it one; being
@@ -8222,7 +6551,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn a_well_authored_page_is_left_exactly_as_it_is() {
         // The author's markup beats our geometry. Nothing to reorder, nothing
         // to synthesize, and above all no second <main> stacked on the first.
@@ -8253,7 +6581,6 @@ mod tests {
 
     /// Three boxes in a right-to-left flex row: the first in the source sits
     /// furthest right, and right is where reading starts.
-    #[cfg(not(target_os = "windows"))]
     const RTL_FIXTURE: &str = r#"<!DOCTYPE html><html><head><style>
         body{margin:0} .row{display:flex;width:1920px}
         .row > div{width:300px;height:200px}
@@ -8265,7 +6592,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn right_to_left_reads_from_the_right() {
         // Sorting by ascending x is only correct in a left-to-right document.
         // Here the leftmost box is the *last* one to read, and blindly sorting
@@ -8296,7 +6622,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn screen_reader_only_text_stays_next_to_what_it_annotates() {
         // .sr-only text is a clipped 1x1 box. It must never be pruned by
         // geometry, and it must not be sorted to an end either: with no box of
@@ -8318,7 +6643,6 @@ mod tests {
 
     /// Fixture covering every prune rule at once, including the one that must
     /// *not* fire: screen-reader-only text.
-    #[cfg(not(target_os = "windows"))]
     const PRUNE_FIXTURE: &str = r#"<!DOCTYPE html><html><head><title>t</title>
         <style>.sronly{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}</style>
         </head><body>
@@ -8332,7 +6656,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn hidden_nodes_are_pruned_but_screen_reader_text_survives() {
         let _guard = launch_flag_guard(false);
         let restore = prune_hidden();
@@ -8360,7 +6683,6 @@ mod tests {
 
     /// A collapsed menu, a dead hidden blurb, and a skip-link target that is an
     /// empty anchor — the three shapes the prune has to tell apart.
-    #[cfg(not(target_os = "windows"))]
     const NAV_FIXTURE: &str = r##"<!DOCTYPE html><html><body>
         <a href="#main-content">Skip to content</a>
         <div class="collapse" style="display:none">
@@ -8376,7 +6698,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn hidden_navigation_survives_but_dead_hidden_text_does_not() {
         let _guard = launch_flag_guard(false);
         let restore = prune_hidden();
@@ -8398,7 +6719,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn an_empty_anchors_id_moves_to_the_next_thing_that_renders() {
         let _guard = launch_flag_guard(false);
         let load = load_fixture("sic-anchor.html", NAV_FIXTURE);
@@ -8415,7 +6735,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn toggling_the_prune_off_brings_hidden_content_back() {
         let _guard = launch_flag_guard(false);
         let restore = prune_hidden();
@@ -8440,7 +6759,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn a_pruned_subtree_keeps_its_forms_counted() {
         // Removing a hidden <form> outright would renumber every later form,
         // while the click path resolves buttons via `document.forms[n]` on the
@@ -8464,7 +6782,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn a_parked_subtree_keeps_its_forms_counted() {
         // The pruner leaves an empty shell where it removes a hidden form, so
         // `document.forms[n]` keeps lining up. Parking never did: a hidden but
@@ -8500,7 +6817,6 @@ mod tests {
 
     /// A OneTrust-shaped banner over a real article.  Each choice rewrites the
     /// body, so a press is observable in the page the provider re-reads.
-    #[cfg(not(target_os = "windows"))]
     const CONSENT_FIXTURE: &str = r#"<!DOCTYPE html><html><body>
         <h1>ARTICLE-HEADING</h1>
         <p>ARTICLE-BODY</p>
@@ -8514,7 +6830,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn a_consent_banner_becomes_a_step_of_its_own() {
         let _guard = launch_flag_guard(false);
         let load = load_fixture("sic-consent.html", CONSENT_FIXTURE);
@@ -8555,7 +6870,6 @@ mod tests {
     /// out of the list of languages entirely, and the content links carrying
     /// `hreflang="nl"` overwrote the switcher's Dutch entry with their own text
     /// and href.
-    #[cfg(not(target_os = "windows"))]
     const SWITCHER_FIXTURE: &str = r#"<!DOCTYPE html><html lang="nl"><head>
         <link href="https://x.invalid/en" rel="alternate" hreflang="en">
         <link href="https://x.invalid/fr" rel="alternate" hreflang="fr">
@@ -8572,7 +6886,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn a_page_with_a_language_switcher_is_just_a_page() {
         let _guard = launch_flag_guard(false);
         let load = load_fixture("sic-switcher.html", SWITCHER_FIXTURE);
@@ -8641,17 +6954,14 @@ mod tests {
     /// app, so a browser-backed test without this leaves a Chrome and its Xvfb
     /// running until the machine is rebooted. Enough of those accumulating is
     /// what took the desktop session down twice.
-    #[cfg(not(target_os = "windows"))]
     struct TestProvider(WebbrowserProvider);
 
-    #[cfg(not(target_os = "windows"))]
     impl TestProvider {
         fn new() -> Self {
             TestProvider(WebbrowserProvider::new())
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
     impl std::ops::Deref for TestProvider {
         type Target = WebbrowserProvider;
         fn deref(&self) -> &Self::Target {
@@ -8659,14 +6969,12 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
     impl std::ops::DerefMut for TestProvider {
         fn deref_mut(&mut self) -> &mut Self::Target {
             &mut self.0
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
     impl Drop for TestProvider {
         fn drop(&mut self) {
             self.0.cleanup();
@@ -8674,7 +6982,6 @@ mod tests {
     }
 
     /// Drive the provider until `tick` reports fresh content, or give up.
-    #[cfg(not(target_os = "windows"))]
     fn pump(p: &mut WebbrowserProvider) -> bool {
         for _ in 0..300 {
             if p.tick() {
@@ -8687,7 +6994,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[cfg(not(target_os = "windows"))]
     fn pressing_a_surfaced_choice_activates_the_real_banner_button() {
         // The whole point of the proxy form: `on_button_press` only ever gets
         // `submit:form_N`, so each choice needs its own form for the selector
@@ -8728,14 +7034,10 @@ mod tests {
     //     live_google_consent -- --ignored --nocapture
     #[test]
     #[ignore]
-    #[cfg(target_os = "linux")]
     fn live_google_consent_offers_both_choices() {
-        let loaded = chromium_runtime().block_on(async {
-            let live = init_live_session().await.expect("launch chrome");
-            let out = navigate_and_get_html(&live.page, "https://www.google.com/").await;
-            close_browser(&live.session).await;
-            out
-        });
+        let mut live = init_live_session().expect("launch chrome");
+        let loaded = navigate_and_get_html(&mut live.chrome, &live.page, "https://www.google.com/");
+        live.chrome.close();
         let loaded = loaded.expect("navigate_and_get_html should not fail");
         assert_eq!(
             loaded.notices,
@@ -8769,7 +7071,6 @@ mod tests {
     //     live_google_reject -- --ignored --nocapture
     #[test]
     #[ignore]
-    #[cfg(target_os = "linux")]
     fn live_google_reject_clears_the_wall() {
         let _guard = launch_flag_guard(false);
         let mut p = TestProvider::new();
@@ -8804,7 +7105,6 @@ mod tests {
     //   cargo test -p sicompass-webbrowser live_bpost -- --ignored --nocapture
     #[test]
     #[ignore]
-    #[cfg(target_os = "linux")]
     fn live_bpost_answers_cookies_then_shows_content() {
         let _guard = launch_flag_guard(false);
         let mut p = TestProvider::new();
@@ -8992,24 +7292,147 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// SDK registration
+// The plugin
 // ---------------------------------------------------------------------------
 
-/// Register the web browser with the SDK factory and manifest registries.
-pub fn register() {
-    sicompass_sdk::register_provider_factory("webbrowser", || Box::new(WebbrowserProvider::new()));
-    sicompass_sdk::register_builtin_manifest(
-        sicompass_sdk::BuiltinManifest::new("webbrowser", "web browser").with_settings(vec![
-            // `urlHistorySize`, not `historySize`: settings are broadcast to
-            // every provider in every tab by bare key, so the key namespace is
-            // shared across the whole app.
-            sicompass_sdk::SettingDecl::text(
-                "web browser",
-                "URL history",
-                "urlHistorySize",
-                "50000",
-            ),
-        ]),
-    );
-    sicompass_sdk::register_url_fetcher(fetch_url_to_ffon);
+impl Plugin for WebbrowserProvider {
+    fn new() -> Self {
+        WebbrowserProvider::new()
+    }
+
+    fn describe(&self) -> Descriptor {
+        Descriptor {
+            name: self.name().to_owned(),
+            display_name: self.display_name(),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn init(&mut self) {
+        // The declared settings, from the host.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(v) = sicompass_pdk::host::get_setting("urlHistorySize") {
+            WebbrowserProvider::on_setting_change(self, "urlHistorySize", &v);
+        }
+        WebbrowserProvider::init(self);
+    }
+
+    fn cleanup(&mut self) {
+        WebbrowserProvider::cleanup(self);
+    }
+
+    /// A page from the browser task asks for a redraw, a navigation that
+    /// landed for the descent into it, and errors are reported.
+    fn poll(&mut self) -> PollResult {
+        let redraw = self.tick();
+        let enter = self.take_navigation_request().is_some();
+        PollResult {
+            redraw,
+            at_root: self.path_segments.is_empty() && self.path_cache == "/",
+            error: self.take_error(),
+            navigation_request: enter.then_some(sicompass_pdk::NavigationRequest::EnterChildren),
+            ..Default::default()
+        }
+    }
+
+    fn fetch(&mut self) -> Vec<FfonElement> {
+        WebbrowserProvider::fetch(self)
+    }
+
+    fn current_path(&self) -> &str {
+        WebbrowserProvider::current_path(self)
+    }
+
+    fn set_current_path(&mut self, path: &str) {
+        WebbrowserProvider::set_current_path(self, path);
+    }
+
+    fn push_path(&mut self, segment: &str) {
+        WebbrowserProvider::push_path(self, segment);
+    }
+
+    fn pop_path(&mut self) {
+        WebbrowserProvider::pop_path(self);
+    }
+
+    fn commit_edit(&mut self, old: &str, new: &str) -> bool {
+        WebbrowserProvider::commit_edit(self, old, new)
+    }
+
+    fn on_button_press(&mut self, function_name: &str) {
+        WebbrowserProvider::on_button_press(self, function_name);
+    }
+
+    fn commands(&self) -> Vec<String> {
+        WebbrowserProvider::commands(self)
+    }
+
+    fn handle_command(
+        &mut self,
+        cmd: &str,
+        elem_key: &str,
+        elem_type: i32,
+    ) -> Result<Option<FfonElement>, String> {
+        let mut error = String::new();
+        let out = WebbrowserProvider::handle_command(self, cmd, elem_key, elem_type, &mut error);
+        if error.is_empty() {
+            Ok(out)
+        } else {
+            Err(error)
+        }
+    }
+
+    fn on_setting_change(&mut self, key: &str, value: &str) {
+        WebbrowserProvider::on_setting_change(self, key, value);
+    }
+
+    /// A page another program links to: rendered in a tab of its own in the
+    /// live Chrome, and handed to the host when it is ready.
+    fn render_url(&mut self, url: &str) -> bool {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return false;
+        }
+        self.send_to_worker(&worker::Job::Render {
+            url: url.to_owned(),
+            prune: prune_hidden(),
+        });
+        true
+    }
+
+    fn run_task(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, String> {
+        match name {
+            #[cfg(target_arch = "wasm32")]
+            worker::BROWSER_TASK => worker::run_browser_task(input),
+            other => {
+                let _ = input;
+                Err(format!("webbrowser has no task named `{other}`"))
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn on_task_event(&mut self, id: u64, event: sicompass_pdk::TaskEvent) {
+        let answer = self
+            .worker
+            .as_ref()
+            .and_then(|w| w.on_task_event(id, &event));
+        match answer {
+            Some(Ok(done)) => self.apply_done(done),
+            Some(Err(e)) => {
+                // The task is gone; the next job starts another. A load it had
+                // in flight is not coming.
+                self.worker = None;
+                if self.loading {
+                    self.apply_done(worker::Done::Failed {
+                        seq: self.nav_seq,
+                        error: e,
+                    });
+                }
+            }
+            None => {}
+        }
+    }
 }
+
+export_plugin!(WebbrowserProvider);
