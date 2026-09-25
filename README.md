@@ -1,4 +1,4 @@
-# webbrowser_plugin_sicompass
+# webbrowser-plugin-sicompass
 
 *The web, in Sicompass.*
 

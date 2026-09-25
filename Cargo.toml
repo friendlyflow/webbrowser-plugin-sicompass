@@ -8,7 +8,7 @@ version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "A web browser for sicompass: pages as lists, rendered by Chrome, as a WASM plugin"
-repository = "https://github.com/friendlyflow/webbrowser_plugin_sicompass"
+repository = "https://github.com/friendlyflow/webbrowser-plugin-sicompass"
 # A plugin ships as a signed release the sicompass Store installs, never on crates.io.
 publish = false
 

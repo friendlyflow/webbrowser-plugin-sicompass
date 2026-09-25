@@ -1,6 +1,6 @@
 # Project Instructions
 
-webbrowser_plugin_sicompass was split out of the
+webbrowser-plugin-sicompass was split out of the
 [sicompass](https://github.com/friendlyflow/sicompass) workspace, and its git
 history before that point is the history of `lib/lib_webbrowser` (earlier
 `lib/lib_webbrowser-rs`, and the C tests in `tests/lib_webbrowser`) there.
