@@ -7436,3 +7436,66 @@ impl Plugin for WebbrowserProvider {
 }
 
 export_plugin!(WebbrowserProvider);
+
+/// The tutorial's paragraphs about this plugin are the plugin's own:
+/// `webbrowser-tutorial`, then `webbrowser-tutorial-2` and so on. The tutorial reads them
+/// from the installed `locales/*.ftl`, so every language needs the same ones.
+#[cfg(test)]
+mod tutorial_text_tests {
+    const LOCALES: [(&str, &str); 4] = [
+        ("en-US", include_str!("../locales/en-US.ftl")),
+        ("nl-BE", include_str!("../locales/nl-BE.ftl")),
+        ("fr-BE", include_str!("../locales/fr-BE.ftl")),
+        ("de-BE", include_str!("../locales/de-BE.ftl")),
+    ];
+
+    /// The plugin's name, kept apart from the `-tutorial` suffix so no
+    /// half-built id appears quoted in the source.
+    const NAME: &str = "webbrowser";
+
+    fn tutorial_id(line: &str) -> Option<&str> {
+        let id = line.split_once(" = ")?.0;
+        let base = format!("{NAME}-tutorial");
+        (id == base || id.starts_with(&format!("{base}-"))).then_some(id)
+    }
+
+    fn tutorial_ids(ftl: &str) -> Vec<&str> {
+        ftl.lines().filter_map(tutorial_id).collect()
+    }
+
+    fn tutorial_text(ftl: &str) -> String {
+        ftl.lines()
+            .filter(|l| tutorial_id(l).is_some())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_language_has_the_same_tutorial_leaves() {
+        let en = tutorial_ids(LOCALES[0].1);
+        assert_eq!(en, ["webbrowser-tutorial", "webbrowser-tutorial-2", "webbrowser-tutorial-3", "webbrowser-tutorial-4"], "en-US's tutorial leaves");
+        for (locale, ftl) in &LOCALES[1..] {
+            assert_eq!(tutorial_ids(ftl), en, "{locale} has drifted from en-US");
+        }
+    }
+
+    /// The browser's own keys and commands must be discoverable from the
+    /// tutorial. `b` and the recall history shipped without any tutorial text at
+    /// all, which is what this test exists to stop happening again.
+    #[test]
+    fn the_tutorial_documents_the_history_bookmarks_and_commands() {
+        let text = tutorial_text(LOCALES[0].1);
+        assert!(
+            text.contains("[bookmark]"),
+            "must give the marker a bookmarked row is announced with, got:\n{text}"
+        );
+        assert!(
+            text.contains("address bar"),
+            "must say where the recall history sits, got:\n{text}"
+        );
+        // The colon commands a reader cannot otherwise guess at.
+        for cmd in ["clear cookies", "show hidden content"] {
+            assert!(text.contains(cmd), "must document the {cmd} command, got:\n{text}");
+        }
+    }
+}
