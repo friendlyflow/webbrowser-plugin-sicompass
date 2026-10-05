@@ -9,59 +9,80 @@ Work on it is usually driven from a sicompass checkout next to this one
 `/update-cargo` take this repo's name as their first argument and then follow
 the skills in this repo's `.claude/skills/`.
 
-It is a sicompass **WASM plugin**: a `cdylib` built for `wasm32-wasip2` with
-`sicompass-pdk`, installed by the sicompass Store from this repo's GitHub
-releases. The plugin platform is described in
-`../sicompass/docs/plugin-platform.md` and `../sicompass/docs/wasm-plugins.md`.
+It is a sicompass **plugin process**: a program (`src/main.rs`) built with the
+SDK's `plugin` feature, which sicompass starts and talks to over its stdin and
+stdout. It runs with the user's rights. The Store installs it from this repo's
+GitHub releases, one build per platform. The plugin platform is described in
+`../sicompass/docs/plugin-platform.md` and `../sicompass/docs/process-plugins.md`.
 
 - `plugin.json` is the manifest. Its `name` is `webbrowser` and its
   `displayName` `web browser` is the settings section (the key the built-in
   had, `urlHistorySize`, so a saved value carries over). It asks for
   `storage` and, under `process`, the names Chrome goes by and `Xvfb`, which
-  `cdp::CHROME_NAMES` and `cdp::XVFB` must match (a test checks). It says
-  `"rendersPages": true`: the host asks it to render the pages other programs
+  `cdp::CHROME_NAMES` and `cdp::XVFB` must match (a test checks). They are
+  what the plugin declares it does, shown to the user before install. It says
+  `"rendersPages": true`: the app asks it to render the pages other programs
   link to.
 - `locales/<lang>.ftl`, every id prefixed `webbrowser-`, in all four
   languages.
 
-## The sandbox, and what it changes
+## How it runs
 
-A call into the plugin's UI instance has ten seconds, and a page load can take
-thirty, so Chrome is never driven from there:
+A call from the app has ten seconds, and a page load can take thirty, so
+Chrome is never driven from a call:
 
-- **Chrome** is started with `process.child.spawn-with-channel` and
-  `--remote-debugging-pipe`: the DevTools protocol on file descriptors 3 and
-  4, no network port. `cdp.rs` is a small blocking client for exactly the
-  calls the browser makes (a tab with a flat session, navigate and wait for
-  the load event, evaluate, viewport, cookies, close). It replaced
-  chromiumoxide. Natively (the live tests) it makes the pipes itself.
-- **Off the screen:** with Xvfb available the plugin starts it
+- **Chrome** is found by name (`src/program.rs`): on `PATH`, then
+  `~/.local/bin`, then on macOS `/Applications` and `~/Applications`
+  (`<name>.app/Contents/MacOS/<name>`), and on Windows the browsers' install
+  folders under Program Files and LocalAppData. It is started with
+  `sicompass_sdk::plugin::command`.
+- **The protocol** (`cdp.rs`, a small blocking client for exactly the calls
+  the browser makes: a tab with a flat session, navigate and wait for the load
+  event, evaluate, viewport, cookies, close). On Unix it goes over
+  `--remote-debugging-pipe`, file descriptors 3 and 4 made here, with no
+  network port. On Windows, which has no descriptors 3 and 4 to give a
+  program, Chrome gets `--remote-debugging-port=0`, writes the port it took to
+  `DevToolsActivePort` in its profile, and the protocol goes over a websocket
+  on 127.0.0.1 (`tungstenite`, plain `ws://`). The ignored test
+  `chrome_answers_over_its_devtools_port` runs that path on Linux too.
+- **Off the screen:** on Linux with Xvfb available the plugin starts it
   (`-displayfd 1`: it picks a free display and says which on stdout) and runs
   Chrome headed on it, which is what sites that turn headless Chrome away
-  accept. Without Xvfb, Chrome runs headless. Either way Chrome gets an
-  accessibility bus address that goes nowhere, so the screen reader never
-  sees it.
-- **The browser task** (`worker.rs`, `worker::BROWSER_TASK`) holds Chrome and
-  the reader's tab for the plugin's life. The UI sends it `Job`s through the
-  task inbox and it answers `Done`s, JSON both ways. Navigations are numbered:
-  an answer for one the user typed past is dropped, and a navigation queued
-  behind a newer one is skipped. Natively the same loop is a thread.
-- **Pages for links** (`render_url`, the host's `sicompass:render-url`) load
-  in a tab of their own in the same Chrome, and go back to the host with
-  `host.page_rendered`.
-- **Chrome's profile** is `/storage/chrome/profile`. Chrome runs outside the
-  sandbox and the host translates only a working directory, so Chrome starts
-  in `/storage/chrome` with a relative `--user-data-dir`. The app moved the
-  built-in's profile and URL history there.
-- **The URL history** is `/storage/history`.
-- Windows is not supported yet: the host's process channel is Unix-only.
+  accept. Without Xvfb, and always on macOS and Windows (where a headed Chrome
+  would be a window on the user's screen), Chrome runs headless. Either way
+  Chrome gets an accessibility bus address that goes nowhere, so the screen
+  reader never sees it.
+- **The browser thread** (`worker.rs`) holds Chrome and the reader's tab for
+  the plugin's life. The UI sends it `Job`s over a channel and takes its
+  `Done`s in `poll`. Navigations are numbered: an answer for one the user
+  typed past is dropped, and a navigation queued behind a newer one is
+  skipped. A thread that dies fails the load in flight.
+- **Pages for links** (`render_url`) load in a tab of their own in the same
+  Chrome, and the browser thread hands them to the app itself with
+  `host::page_rendered`.
+- **Stopping Chrome.** Every program started is registered in a
+  `cdp::Children`. Dropping the `Worker` (in `cleanup`, which the runtime
+  calls when the app closes the plugin's stdin, and on drop) asks the thread
+  to close Chrome, and when the thread is busy with a load it stops Chrome and
+  Xvfb from outside (`SIGTERM`, then kill), all inside the runtime's two
+  seconds. Behind that: Chrome exits when its pipe closes, Xvfb has
+  `-terminate`, and on Linux both get `PR_SET_PDEATHSIG`. A Chrome left behind
+  is the worst outcome here.
+- **Chrome's profile** is `chrome/profile` in the plugin's storage folder
+  (`sicompass_sdk::plugin::storage_dir`), and **the URL history** is `history`
+  there. Outside sicompass (the tests) the profile is a throwaway folder under
+  the temp folder and the history is never written (`TEST_NO_HISTORY`).
+- **Strings** come from the app (`host::translate`). The unit tests run
+  outside sicompass and read the English bundle instead (`src/localize.rs`).
+- stdout is the channel to the app. `println!` lands in stderr, the app's log.
 
 ## Environment (Nix)
 
 The toolchain comes from the flake dev shell in [flake.nix](flake.nix): Rust
-from rust-overlay with the `wasm32-wasip2` target (nixpkgs' rustc has no `std`
-for it), `wasm-tools` and `jq`. Nothing is installed system-wide. Chrome and
-Xvfb are not in it: the live tests use the ones installed on the machine.
+from rust-overlay with this computer's plugin target (static musl on Linux,
+which nixpkgs' rustc has no `std` for) and `jq`. Nothing is installed
+system-wide. Chrome and Xvfb are not in it: the live tests use the ones
+installed on the machine.
 
 - **Check once per session**, then stick with the answer: `command -v cargo`.
   - Non-empty: the shell is inside `nix develop`, so run `cargo ...` directly.
@@ -89,8 +110,8 @@ instead, or split into separate sentences.
 ## Testing
 
 - After implementing changes, always run the tests before finishing:
-  `cargo test` (natively), and `./scripts/release-plugin.sh --dry-run`, which
-  also builds the component and audits its imports.
+  `cargo test`, and `./scripts/release-plugin.sh --dry-run`, which also builds
+  this computer's release and verifies it the way the Store will.
 - The live tests (`#[ignore]`) start a real Chrome: `cargo test -- --ignored
   --test-threads=1`, one at a time. Each closes its own Chrome and Xvfb, and
   afterwards none should be left (`ps -eo args | grep remote-debugging-pipe`).
@@ -121,6 +142,10 @@ against the `PLUGIN_PUBLIC_KEY` variable, the key the sicompass store list
 names. The secret key file is `~/.config/sicompass/plugin-keys/webbrowser.key`
 on the maintainer's machine. Never print, copy or commit it.
 
-The SDK and the pdk come from crates.io (the source is
-`../sicompass-plugin-sdk`). The commented-out `[patch]` in `Cargo.toml` is for
-working on them together, and stays commented on main.
+The SDK comes from crates.io (the source is `../sicompass-plugin-sdk`). The
+commented-out `[patch]` in `Cargo.toml` is for working on them together, and
+stays commented on main.
+
+A release has one archive per platform. The release workflow builds them on
+five runners (Linux x86_64 and arm64 as static musl, macOS arm64 and x86_64,
+Windows x86_64), then packs, signs and verifies them in one job.

@@ -17,9 +17,10 @@ installed it runs as a normal browser on an invisible display, which is what a
 website expects to see. Without it Chrome runs headless, which a few sites
 detect and block.
 
-The browser asks to start Chrome and Xvfb, and nothing else. The Store shows
-that before you install it, and installing it is your approval. It works on
-Linux and macOS.
+The browser says it starts Chrome and Xvfb, and nothing else. The Store shows
+that before you install it. Like any program you install, it runs with your
+rights. It works on Linux, macOS and Windows. On macOS and Windows Chrome
+always runs headless.
 
 ## Install
 
@@ -27,25 +28,30 @@ In Sicompass, open store, then programs, and press Enter on install next to
 webbrowser. The Store checks the release's signature before installing it, and
 keeps it up to date.
 
+To install a build of your own instead, copy `plugin.json`, the built
+`plugin` program (`plugin.exe` on Windows) and `locales/` into a folder named
+`webbrowser` in the Sicompass plugins folder (`~/.config/sicompass/plugins/` on
+Linux, `~/Library/Application Support/sicompass/plugins/` on macOS) and
+restart Sicompass.
+
 ## Building from source
 
 ```bash
-nix develop          # the toolchain, with the wasm32-wasip2 target
-cargo test           # natively, no Chrome needed
+nix develop          # the toolchain
+cargo test           # no Chrome needed
 cargo test -- --ignored --test-threads=1   # against a real Chrome
-cargo build --release --target wasm32-wasip2
-cp target/wasm32-wasip2/release/webbrowser_plugin.wasm plugin.wasm
+cargo build --release
+cp target/release/webbrowser-plugin plugin
 ```
 
-`./scripts/release-plugin.sh --dry-run` does the build, checks the component
-against `plugin.json`, and signs and verifies it with a throwaway key, the way
-a release is made.
+`./scripts/release-plugin.sh --dry-run` builds this computer's release, packs
+it, and signs and verifies it with a throwaway key, the way a release is made.
 
 ## Related repositories
 
 - [sicompass](https://github.com/friendlyflow/sicompass), the application
 - [sicompass-plugin-sdk](https://github.com/friendlyflow/sicompass-plugin-sdk),
-  the SDK, the WASM plugin kit and the cloud backup library
+  the SDK, the plugin kit and the cloud backup library
 
 ## Community
 

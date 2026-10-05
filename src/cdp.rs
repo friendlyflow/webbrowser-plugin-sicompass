@@ -1,20 +1,33 @@
 //! Driving Chrome over the DevTools protocol (CDP), blocking.
 //!
-//! Chrome is started with `--remote-debugging-pipe`: it reads protocol
-//! messages on file descriptor 3 and writes them on 4, each one JSON ended by
-//! a NUL byte. No network port is opened, so nothing else on the machine can
-//! drive it. In the sandbox the host starts it with
-//! `process.child.spawn-with-channel`, which puts those two descriptors on a
-//! message channel. Natively (the live tests) the pipes are made here.
+//! On Unix, Chrome is started with `--remote-debugging-pipe`: it reads
+//! protocol messages on file descriptor 3 and writes them on 4, each one JSON
+//! ended by a NUL byte, and the pipes are made here. No network port is
+//! opened, so nothing else on the machine can drive it, and Chrome exits when
+//! the pipe closes, so it never outlives the plugin.
+//!
+//! Windows has no descriptors 3 and 4 to hand a program. There Chrome is
+//! started with `--remote-debugging-port=0`: it picks a free port on
+//! 127.0.0.1 and writes it to `DevToolsActivePort` in its profile, and the
+//! protocol goes over a websocket to it (`tungstenite`, plain `ws://`).
 //!
 //! Only the handful of calls the browser makes are here: a tab
 //! (`Target.createTarget`, attached with a flat session), navigation, script
-//! evaluation, the viewport, cookies and closing. All of it runs in the
-//! browser task, one call at a time, so every wait is a poll of the pipe with
-//! a deadline.
+//! evaluation, the viewport, cookies and closing. All of it runs on the
+//! browser thread, one call at a time, so every wait is a poll of the channel
+//! with a deadline.
+//!
+//! Every program started is registered in a [`Children`], so the plugin can
+//! stop them from its own thread when sicompass lets it go, and each is
+//! stopped when dropped.
 
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// The viewport every page is rendered at.
@@ -33,8 +46,9 @@ pub const VIEWPORT_H: u32 = 1080;
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The names Chrome goes by, in the order they are tried. Each one is a
-/// program the plugin's `process` grant lists: on Linux the commands on
-/// `PATH`, on macOS the applications (found in `/Applications`).
+/// program the plugin's `process` permission lists: on Linux the commands on
+/// `PATH`, on macOS the applications (in `/Applications`), on Windows the
+/// browsers in their install folders (see [`crate::program`]).
 pub const CHROME_NAMES: &[&str] = &[
     "google-chrome",
     "google-chrome-stable",
@@ -105,6 +119,34 @@ fn chrome_args(headless: bool, user_data_dir: &str) -> Vec<String> {
     args
 }
 
+/// [`chrome_args`] for Windows: the protocol on a port of Chrome's choosing on
+/// 127.0.0.1 instead of the pipe.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn port_args(mut args: Vec<String>) -> Vec<String> {
+    for a in &mut args {
+        if a == "--remote-debugging-pipe" {
+            *a = "--remote-debugging-port=0".to_owned();
+        }
+    }
+    args
+}
+
+/// The port and the browser's websocket path, from `DevToolsActivePort`: the
+/// port on the first line, the path on the second.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_devtools_active_port(text: &str) -> Option<(u16, String)> {
+    let mut lines = text.lines();
+    let port = lines
+        .next()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p != 0)?;
+    let path = lines.next()?.trim();
+    path.starts_with("/devtools/browser/")
+        .then(|| (port, path.to_owned()))
+}
+
 /// Chrome's environment: never the session's accessibility bus, and, on a
 /// virtual display, that display rather than the compositor. Returns what to
 /// set and what to remove.
@@ -140,200 +182,216 @@ fn xvfb_args() -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// The pipe
+// The programs
 // ---------------------------------------------------------------------------
 
-/// A started program with a message channel: Chrome, or Xvfb (no channel).
-#[cfg(target_arch = "wasm32")]
-pub struct Proc {
-    child: sicompass_pdk::process::Child,
-}
+type Shared = Arc<Mutex<Child>>;
 
-#[cfg(target_arch = "wasm32")]
-impl Proc {
-    fn start(
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        env: &[(String, String)],
-        unset: &[String],
-        channel: bool,
-    ) -> Result<Proc, String> {
-        use sicompass_pdk::process::Child;
-        let child = if channel {
-            Child::spawn_with_channel(program, args, cwd, env, unset)?
-        } else {
-            Child::spawn(program, args, cwd, env, unset, None)?
-        };
-        Ok(Proc { child })
+/// Every program one browser started (Chrome, Xvfb), so they can all be
+/// stopped from another thread than the one driving them: the plugin's
+/// `cleanup` must not wait for a page load to finish before Chrome goes.
+#[derive(Clone, Default)]
+pub struct Children(Arc<Mutex<Vec<Weak<Mutex<Child>>>>>);
+
+impl Children {
+    fn add(&self, child: &Shared) {
+        let mut list = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        list.retain(|w| w.strong_count() > 0);
+        list.push(Arc::downgrade(child));
     }
 
-    fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.child.channel_write(bytes)
-    }
-
-    fn receive(&mut self) -> Vec<u8> {
-        self.child.channel_read(1 << 20)
-    }
-
-    fn stdout(&mut self) -> Vec<u8> {
-        self.child.read(4096)
-    }
-
-    fn stderr(&mut self) -> Vec<u8> {
-        self.child.read_stderr(1 << 16)
-    }
-
-    fn exited(&mut self) -> bool {
-        self.child.try_wait().is_some()
-    }
-
-    fn kill(&mut self) {
-        self.child.kill();
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub struct Proc {
-    child: std::process::Child,
-    to_child: Option<std::fs::File>,
-    from_child: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
-    stdout: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
-    stderr: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Proc {
-    /// Natively, `program` is looked up on `PATH` as the host would, and the
-    /// channel is a pair of pipes on file descriptors 3 and 4.
-    fn start(
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        env: &[(String, String)],
-        unset: &[String],
-        channel: bool,
-    ) -> Result<Proc, String> {
-        use std::io::Read;
-        use std::os::fd::{AsRawFd, FromRawFd};
-        use std::os::unix::process::CommandExt;
-        use std::process::{Command, Stdio};
-
-        fn reader(mut r: impl Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let mut buf = vec![0u8; 1 << 16];
-                while let Ok(n) = r.read(&mut buf) {
-                    if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
-                        return;
-                    }
-                }
-            });
-            rx
+    /// Stop every program still running: asked to end first (`SIGTERM`, so
+    /// Chrome closes its own helpers and its profile), killed after `grace`.
+    pub fn stop_all(&self, grace: Duration) {
+        let live: Vec<Shared> = self
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for child in &live {
+            ask_to_end(child);
         }
-        fn pipe() -> Result<(std::fs::File, std::fs::File), String> {
-            let mut fds = [0i32; 2];
-            // SAFETY: `fds` has room for the two descriptors pipe(2) writes.
-            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-                return Err(std::io::Error::last_os_error().to_string());
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline && live.iter().any(|c| !has_exited(c)) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for child in &live {
+            kill(child);
+        }
+    }
+
+    /// How many of the programs still run.
+    #[cfg(test)]
+    fn running(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|c| !has_exited(c))
+            .count()
+    }
+}
+
+fn lock(child: &Shared) -> std::sync::MutexGuard<'_, Child> {
+    child.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Whether the program has ended (and is reaped).
+fn has_exited(child: &Shared) -> bool {
+    !matches!(lock(child).try_wait(), Ok(None))
+}
+
+/// Ask the program to end. Only while it has not been reaped, so its pid is
+/// still its own.
+fn ask_to_end(child: &Shared) {
+    let mut c = lock(child);
+    if !matches!(c.try_wait(), Ok(None)) {
+        return;
+    }
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(c.id()) {
+        // SAFETY: kill(2) with the pid of a child that has not been reaped.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+    // Windows has no polite request for a windowless program.
+    #[cfg(not(unix))]
+    let _ = c.kill();
+}
+
+/// Kill the program and reap it. Nothing when it has ended already (`std`
+/// remembers a reaped child and signals nothing).
+fn kill(child: &Shared) {
+    let mut c = lock(child);
+    let _ = c.kill();
+    let _ = c.wait();
+}
+
+/// A started program: Chrome, or Xvfb.
+pub struct Proc {
+    child: Shared,
+    stdout: Option<Receiver<Vec<u8>>>,
+    stderr: Option<Receiver<Vec<u8>>>,
+}
+
+/// Bytes read from `r` by a thread of its own, until it ends.
+fn reader(mut r: impl Read + Send + 'static) -> Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 1 << 16];
+        while let Ok(n) = r.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                return;
             }
-            // SAFETY: both were just opened, and nothing else owns them.
-            Ok(unsafe {
-                (
-                    std::fs::File::from_raw_fd(fds[0]),
-                    std::fs::File::from_raw_fd(fds[1]),
-                )
-            })
         }
+    });
+    rx
+}
 
-        let mut cmd = Command::new(program);
+fn drain(rx: &Option<Receiver<Vec<u8>>>) -> Vec<u8> {
+    rx.as_ref()
+        .map(|rx| rx.try_iter().flatten().collect())
+        .unwrap_or_default()
+}
+
+/// The two ends a child talks the DevTools protocol on, as file descriptors
+/// 3 (it reads) and 4 (it writes).
+#[cfg(unix)]
+struct ChildFds {
+    reads: std::io::PipeReader,
+    writes: std::io::PipeWriter,
+}
+
+impl Proc {
+    /// Start `program` with `fds` (Unix) as its descriptors 3 and 4. It is
+    /// added to `children`, and stopped when the `Proc` is dropped.
+    fn start(
+        program: &Path,
+        args: &[String],
+        env: &[(String, String)],
+        unset: &[String],
+        children: &Children,
+        #[cfg(unix)] fds: Option<&ChildFds>,
+    ) -> Result<Proc, String> {
+        let mut cmd = sicompass_sdk::plugin::command(program);
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-        }
         for k in unset {
             cmd.env_remove(k);
         }
         cmd.envs(env.iter().map(|(k, v)| (k, v)));
-        let mut ends = None;
-        if channel {
-            let (child_reads, to_child) = pipe()?;
-            let (from_child, child_writes) = pipe()?;
-            let (r, w) = (child_reads.as_raw_fd(), child_writes.as_raw_fd());
-            // SAFETY: only dup2 between fork and exec, which is
-            // async-signal-safe. dup2 clears close-on-exec on 3 and 4.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let fds = fds.map(|f| (f.reads.as_raw_fd(), f.writes.as_raw_fd()));
+            // SAFETY: only async-signal-safe calls (fcntl, dup2, prctl) between
+            // fork and exec.
             unsafe {
                 cmd.pre_exec(move || {
-                    if libc::dup2(r, 3) < 0 || libc::dup2(w, 4) < 0 {
-                        return Err(std::io::Error::last_os_error());
+                    // On Linux the program goes when the thread that started
+                    // it does (the plugin's browser thread, or the plugin
+                    // itself, killed): never a Chrome left behind.
+                    #[cfg(target_os = "linux")]
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                    if let Some((r, w)) = fds {
+                        // Out of the way first, so 3 and 4 never overwrite
+                        // each other's source. dup2 clears close-on-exec.
+                        let r = libc::fcntl(r, libc::F_DUPFD, 10);
+                        let w = libc::fcntl(w, libc::F_DUPFD, 10);
+                        if r < 0 || w < 0 || libc::dup2(r, 3) < 0 || libc::dup2(w, 4) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
                     Ok(())
                 });
             }
-            ends = Some((child_reads, to_child, from_child, child_writes));
         }
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("cannot start `{program}`: {e}"))?;
-        let (to_child, from_child) = match ends {
-            Some((child_reads, to_child, from_child, child_writes)) => {
-                drop(child_reads);
-                drop(child_writes);
-                (Some(to_child), Some(reader(from_child)))
-            }
-            None => (None, None),
-        };
+            .map_err(|e| format!("cannot start `{}`: {e}", program.display()))?;
         let stdout = child.stdout.take().map(reader);
         let stderr = child.stderr.take().map(reader);
+        let child = Arc::new(Mutex::new(child));
+        children.add(&child);
         Ok(Proc {
             child,
-            to_child,
-            from_child,
             stdout,
             stderr,
         })
     }
 
-    fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
-        use std::io::Write;
-        match &mut self.to_child {
-            Some(f) => f.write_all(bytes).map_err(|e| e.to_string()),
-            None => Err("no channel".to_owned()),
-        }
-    }
-
-    fn drain(rx: &Option<std::sync::mpsc::Receiver<Vec<u8>>>) -> Vec<u8> {
-        rx.as_ref()
-            .map(|rx| rx.try_iter().flatten().collect())
-            .unwrap_or_default()
-    }
-
-    fn receive(&mut self) -> Vec<u8> {
-        Self::drain(&self.from_child)
-    }
-
     fn stdout(&mut self) -> Vec<u8> {
-        Self::drain(&self.stdout)
+        drain(&self.stdout)
     }
 
     fn stderr(&mut self) -> Vec<u8> {
-        Self::drain(&self.stderr)
+        drain(&self.stderr)
     }
 
     fn exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
+        has_exited(&self.child)
+    }
+
+    /// Wait up to `grace` for the program to end by itself.
+    fn wait_for_exit(&mut self, grace: Duration) {
+        let deadline = Instant::now() + grace;
+        while !self.exited() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        kill(&self.child);
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl Drop for Proc {
     fn drop(&mut self) {
         // Never leave a Chrome (or its Xvfb) behind: the old browser tests
@@ -342,23 +400,124 @@ impl Drop for Proc {
     }
 }
 
-/// Whether `program` can be started (a name the grant lists and the host
-/// finds). Natively, whether it is on `PATH`.
-fn available(program: &str) -> bool {
-    #[cfg(target_arch = "wasm32")]
-    {
-        sicompass_pdk::process::which(program).is_ok()
+// ---------------------------------------------------------------------------
+// The protocol's channel
+// ---------------------------------------------------------------------------
+
+/// Where the DevTools messages go and come from. Either way a message read is
+/// JSON ended by a NUL byte, as on the pipe.
+enum Channel {
+    /// `--remote-debugging-pipe`: Chrome's descriptors 3 and 4 (Unix).
+    #[cfg(unix)]
+    Pipe {
+        to_chrome: std::io::PipeWriter,
+        from_chrome: Receiver<Vec<u8>>,
+    },
+    /// `--remote-debugging-port`: a websocket on 127.0.0.1, served by a
+    /// thread of its own (Windows, which has no descriptors 3 and 4 to give).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Socket {
+        to_chrome: Sender<String>,
+        from_chrome: Receiver<Vec<u8>>,
+    },
+}
+
+impl Channel {
+    fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+        match self {
+            #[cfg(unix)]
+            Channel::Pipe { to_chrome, .. } => {
+                std::io::Write::write_all(to_chrome, bytes).map_err(|e| e.to_string())
+            }
+            Channel::Socket { to_chrome, .. } => {
+                let text = std::str::from_utf8(bytes.strip_suffix(&[0]).unwrap_or(bytes))
+                    .map_err(|e| e.to_string())?;
+                to_chrome
+                    .send(text.to_owned())
+                    .map_err(|_| "the connection to Chrome closed".to_owned())
+            }
+        }
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::env::var_os("PATH")
-            .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(program).is_file()))
+
+    fn receive(&mut self) -> Vec<u8> {
+        match self {
+            #[cfg(unix)]
+            Channel::Pipe { from_chrome, .. } => from_chrome.try_iter().flatten().collect(),
+            Channel::Socket { from_chrome, .. } => from_chrome.try_iter().flatten().collect(),
+        }
+    }
+
+    /// Serve `ws` on a thread: messages sent go out, messages read come back
+    /// NUL-ended. The thread closes the socket when the channel is dropped.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn socket(mut ws: tungstenite::WebSocket<std::net::TcpStream>) -> Result<Channel, String> {
+        use tungstenite::{Error, Message};
+        ws.get_mut()
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .map_err(|e| e.to_string())?;
+        let (to_chrome, outgoing) = mpsc::channel::<String>();
+        let (incoming, from_chrome) = mpsc::channel::<Vec<u8>>();
+        std::thread::Builder::new()
+            .name("webbrowser-cdp".to_owned())
+            .spawn(move || {
+                loop {
+                    loop {
+                        match outgoing.try_recv() {
+                            Ok(text) => {
+                                if ws.send(Message::text(text)).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                let _ = ws.close(None);
+                                let _ = ws.flush();
+                                return;
+                            }
+                        }
+                    }
+                    let bytes = match ws.read() {
+                        Ok(Message::Text(t)) => t.as_bytes().to_vec(),
+                        Ok(Message::Binary(b)) => b.to_vec(),
+                        Ok(_) => continue,
+                        Err(Error::Io(e))
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(_) => return,
+                    };
+                    let mut msg = bytes;
+                    msg.push(0);
+                    if incoming.send(msg).is_err() {
+                        return;
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Channel::Socket {
+            to_chrome,
+            from_chrome,
+        })
     }
 }
 
+/// Whether `program` can be started: found by name (see [`crate::program`]).
+fn available(program: &str) -> bool {
+    crate::program::resolve(program).is_some()
+}
+
+/// Whether Chrome is put on a virtual X display when Xvfb is there. Not on
+/// macOS, where Chrome draws with Cocoa whatever `DISPLAY` says, so a headed
+/// Chrome would be a window on the user's screen. Not on Windows either.
+const XVFB_POSSIBLE: bool = cfg!(all(unix, not(target_os = "macos")));
+
 /// The first Chrome that can be started.
-pub fn find_chrome() -> Option<&'static str> {
-    CHROME_NAMES.iter().copied().find(|n| available(n))
+pub fn find_chrome() -> Option<PathBuf> {
+    CHROME_NAMES.iter().find_map(|n| crate::program::resolve(n))
 }
 
 pub fn chrome_missing_message() -> String {
@@ -379,6 +538,7 @@ pub struct Page {
 /// A running Chrome, and the virtual display it is on, if any.
 pub struct Chrome {
     proc: Proc,
+    channel: Channel,
     xvfb: Option<Proc>,
     /// Bytes read that do not make a whole message yet.
     buf: Vec<u8>,
@@ -392,14 +552,12 @@ pub struct Chrome {
 
 /// How a Chrome is launched.
 pub struct Launch<'a> {
-    /// The Chrome program name.
-    pub chrome: &'a str,
-    /// The working directory for Chrome, where its profile is
-    /// (`--user-data-dir` is relative to it): a folder in the plugin's
-    /// storage, which the host maps to the real one.
-    pub profile_parent: &'a str,
-    /// The profile folder's name in `profile_parent`.
-    pub profile: &'a str,
+    /// The Chrome program.
+    pub chrome: &'a Path,
+    /// Chrome's profile folder (`--user-data-dir`).
+    pub profile: &'a Path,
+    /// Where Chrome and its Xvfb are registered, for stopping them.
+    pub children: &'a Children,
 }
 
 impl Chrome {
@@ -407,8 +565,13 @@ impl Chrome {
     /// what sites that turn headless Chrome away accept, and headless
     /// otherwise.
     pub fn launch(opts: &Launch) -> Result<Chrome, String> {
-        let xvfb = if available(XVFB) {
-            match start_xvfb() {
+        Self::launch_with(opts, start_chrome)
+    }
+
+    /// [`Chrome::launch`], with the protocol channel made by `start`.
+    fn launch_with(opts: &Launch, start: StartChrome) -> Result<Chrome, String> {
+        let xvfb = if XVFB_POSSIBLE && available(XVFB) {
+            match start_xvfb(opts.children) {
                 Ok(x) => Some(x),
                 Err(e) => {
                     log(&format!(
@@ -421,17 +584,11 @@ impl Chrome {
             None
         };
         let (env, unset) = chrome_env(xvfb.as_ref().map(|(_, d)| *d));
-        let args = chrome_args(xvfb.is_none(), opts.profile);
-        let proc = Proc::start(
-            opts.chrome,
-            &args,
-            Some(opts.profile_parent),
-            &env,
-            &unset,
-            true,
-        )?;
+        let args = chrome_args(xvfb.is_none(), &opts.profile.to_string_lossy());
+        let (proc, channel) = start(opts, args, &env, &unset)?;
         let mut chrome = Chrome {
             proc,
+            channel,
             xvfb: xvfb.map(|(p, _)| p),
             buf: Vec::new(),
             next_id: 0,
@@ -444,7 +601,10 @@ impl Chrome {
             .map_err(|e| {
                 let stderr = String::from_utf8_lossy(&chrome.proc.stderr()).into_owned();
                 let tail: String = stderr.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
-                format!("Chrome ({}) did not start: {e} {tail}", opts.chrome)
+                format!(
+                    "Chrome ({}) did not start: {e} {tail}",
+                    opts.chrome.display()
+                )
             })?;
         Ok(chrome)
     }
@@ -591,9 +751,15 @@ impl Chrome {
         );
     }
 
-    /// Close Chrome, and the display it was on.
+    /// Close Chrome, and the display it was on: asked to close, so it saves
+    /// its profile, and killed if it has not gone a second later.
     pub fn close(mut self) {
-        let _ = self.call(None, "Browser.close", json!({}), Duration::from_millis(500));
+        if self
+            .call(None, "Browser.close", json!({}), Duration::from_millis(500))
+            .is_ok()
+        {
+            self.proc.wait_for_exit(Duration::from_secs(1));
+        }
         self.proc.kill();
         if let Some(x) = &mut self.xvfb {
             x.kill();
@@ -633,7 +799,7 @@ impl Chrome {
         }
         let mut bytes = serde_json::to_vec(&msg).map_err(|e| e.to_string())?;
         bytes.push(0);
-        self.proc
+        self.channel
             .send(&bytes)
             .map_err(|e| format!("{method}: {e}"))?;
         let deadline = Instant::now() + timeout;
@@ -680,7 +846,7 @@ impl Chrome {
     /// Read what Chrome sent, sorting answers from events. `false` when
     /// there was nothing.
     fn pump(&mut self) -> bool {
-        let got = self.proc.receive();
+        let got = self.channel.receive();
         if got.is_empty() {
             return false;
         }
@@ -704,10 +870,108 @@ impl Chrome {
     }
 }
 
+/// How Chrome is started on a protocol channel.
+type StartChrome =
+    fn(&Launch, Vec<String>, &[(String, String)], &[String]) -> Result<(Proc, Channel), String>;
+
+/// Start Chrome on its protocol channel: the pipe on Unix.
+#[cfg(unix)]
+fn start_chrome(
+    opts: &Launch,
+    args: Vec<String>,
+    env: &[(String, String)],
+    unset: &[String],
+) -> Result<(Proc, Channel), String> {
+    let (reads, to_chrome) = std::io::pipe().map_err(|e| e.to_string())?;
+    let (from_chrome, writes) = std::io::pipe().map_err(|e| e.to_string())?;
+    let fds = ChildFds { reads, writes };
+    let proc = Proc::start(opts.chrome, &args, env, unset, opts.children, Some(&fds))?;
+    // Chrome's ends are Chrome's now: with ours closed, the pipe ends when
+    // either side goes.
+    drop(fds);
+    let channel = Channel::Pipe {
+        to_chrome,
+        from_chrome: reader(from_chrome),
+    };
+    Ok((proc, channel))
+}
+
+/// Start Chrome on its protocol channel: a websocket on Windows.
+#[cfg(not(unix))]
+fn start_chrome(
+    opts: &Launch,
+    args: Vec<String>,
+    env: &[(String, String)],
+    unset: &[String],
+) -> Result<(Proc, Channel), String> {
+    start_chrome_on_a_port(opts, args, env, unset)
+}
+
+/// Start Chrome with the protocol on a port of its choosing, and connect to
+/// it: the way on Windows, and testable anywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn start_chrome_on_a_port(
+    opts: &Launch,
+    args: Vec<String>,
+    env: &[(String, String)],
+    unset: &[String],
+) -> Result<(Proc, Channel), String> {
+    let port_file = opts.profile.join("DevToolsActivePort");
+    // One left by an earlier Chrome names a port nobody listens on.
+    let _ = std::fs::remove_file(&port_file);
+    let mut proc = Proc::start(
+        opts.chrome,
+        &port_args(args),
+        env,
+        unset,
+        opts.children,
+        #[cfg(unix)]
+        None,
+    )?;
+    let deadline = Instant::now() + LAUNCH_TIMEOUT;
+    let (port, path) = loop {
+        if let Some(found) = std::fs::read_to_string(&port_file)
+            .ok()
+            .and_then(|t| parse_devtools_active_port(&t))
+        {
+            break found;
+        }
+        if proc.exited() {
+            return Err("Chrome exited before it opened its DevTools port".to_owned());
+        }
+        if Instant::now() >= deadline {
+            return Err("Chrome opened no DevTools port".to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stream = std::net::TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| format!("cannot reach Chrome's DevTools port: {e}"))?;
+    let _ = stream.set_nodelay(true);
+    let config = tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(512 << 20))
+        .max_frame_size(Some(512 << 20));
+    let (ws, _) = tungstenite::client::client_with_config(
+        format!("ws://127.0.0.1:{port}{path}"),
+        stream,
+        Some(config),
+    )
+    .map_err(|e| format!("Chrome's DevTools websocket: {e}"))?;
+    Ok((proc, Channel::socket(ws)?))
+}
+
 /// Start Xvfb on a display of its choosing (`-displayfd 1`: it writes the
 /// number it took to its stdout), and wait for that number.
-fn start_xvfb() -> Result<(Proc, u32), String> {
-    let mut proc = Proc::start(XVFB, &xvfb_args(), None, &[], &[], false)?;
+fn start_xvfb(children: &Children) -> Result<(Proc, u32), String> {
+    let program = crate::program::resolve(XVFB).ok_or("Xvfb was not found")?;
+    let mut proc = Proc::start(
+        &program,
+        &xvfb_args(),
+        &[],
+        &[],
+        children,
+        #[cfg(unix)]
+        None,
+    )?;
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut out = Vec::new();
     loop {
@@ -727,11 +991,8 @@ fn start_xvfb() -> Result<(Proc, u32), String> {
     }
 }
 
-fn log(msg: &str) {
-    #[cfg(target_arch = "wasm32")]
-    sicompass_pdk::host::log(msg);
-    #[cfg(not(target_arch = "wasm32"))]
-    eprintln!("webbrowser: {msg}");
+pub(crate) fn log(msg: &str) {
+    sicompass_sdk::plugin::host::log(&format!("webbrowser: {msg}"));
 }
 
 #[cfg(test)]
@@ -818,15 +1079,15 @@ mod tests {
     #[test]
     #[ignore]
     fn xvfb_starts_on_a_display_of_its_own_and_goes_away() {
-        let (mut proc, display) = start_xvfb().expect("Xvfb starts");
+        let (mut proc, display) = start_xvfb(&Children::default()).expect("Xvfb starts");
         eprintln!("Xvfb took display :{display}");
         assert!(!proc.exited());
         proc.kill();
         assert!(proc.exited());
     }
 
-    /// Every program started is one the manifest asks for, and nothing more
-    /// is asked for than is started: the user approves exactly this list.
+    /// Every program started is one the manifest names, and nothing more is
+    /// named than is started: the user is shown exactly this list.
     #[test]
     fn the_manifest_grants_exactly_the_programs_started() {
         let manifest: Value = serde_json::from_str(include_str!("../plugin.json")).unwrap();
@@ -839,6 +1100,125 @@ mod tests {
         let started: Vec<&str> = CHROME_NAMES.iter().copied().chain([XVFB]).collect();
         assert_eq!(granted, started);
         assert_eq!(manifest["rendersPages"], true);
+    }
+
+    /// Windows speaks the protocol on a port: the pipe flag is swapped for
+    /// it, and nothing else changes.
+    #[test]
+    fn the_port_flavour_swaps_only_the_pipe() {
+        let pipe = chrome_args(true, "p");
+        let port = port_args(pipe.clone());
+        assert!(port.contains(&"--remote-debugging-port=0".to_owned()));
+        assert!(!port.contains(&"--remote-debugging-pipe".to_owned()));
+        assert_eq!(pipe.len(), port.len());
+    }
+
+    #[test]
+    fn devtools_active_port_is_read_as_a_port_and_a_browser_path() {
+        assert_eq!(
+            parse_devtools_active_port("41235\n/devtools/browser/abc-123\n"),
+            Some((41235, "/devtools/browser/abc-123".to_owned()))
+        );
+        // Half-written, or not Chrome's.
+        assert_eq!(parse_devtools_active_port("41235\n"), None);
+        assert_eq!(parse_devtools_active_port(""), None);
+        assert_eq!(parse_devtools_active_port("0\n/devtools/browser/x"), None);
+        assert_eq!(parse_devtools_active_port("41235\n/json"), None);
+    }
+
+    /// What the plugin's cleanup relies on: every program a browser started
+    /// can be stopped from another thread, including one that ignores the
+    /// polite request.
+    #[cfg(unix)]
+    #[test]
+    fn every_child_is_stopped_even_one_that_ignores_sigterm() {
+        let children = Children::default();
+        let sh = Path::new("/bin/sh");
+        let start = |script: &str| {
+            Proc::start(
+                sh,
+                &["-c".to_owned(), script.to_owned()],
+                &[],
+                &[],
+                &children,
+                None,
+            )
+            .expect("sh starts")
+        };
+        let polite = start("exec sleep 30");
+        let stubborn = start("trap '' TERM; exec sleep 30");
+        assert_eq!(children.running(), 2);
+        let t = Instant::now();
+        children.stop_all(Duration::from_millis(300));
+        assert_eq!(children.running(), 0);
+        assert!(t.elapsed() < Duration::from_secs(5));
+        drop((polite, stubborn));
+    }
+
+    /// A dropped program does not run on.
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_proc_is_stopped() {
+        let children = Children::default();
+        let proc = Proc::start(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), "exec sleep 30".to_owned()],
+            &[],
+            &[],
+            &children,
+            None,
+        )
+        .expect("sh starts");
+        let child = proc.child.clone();
+        drop(proc);
+        assert!(has_exited(&child));
+    }
+
+    /// The Windows way (a port and a websocket), run here against a real
+    /// Chrome: it starts, answers, and goes. Needs Chrome.
+    #[test]
+    #[ignore]
+    fn chrome_answers_over_its_devtools_port() {
+        let chrome = find_chrome().expect("Chrome is installed");
+        let profile = tempfile::tempdir().unwrap();
+        let children = Children::default();
+        let opts = Launch {
+            chrome: &chrome,
+            profile: profile.path(),
+            children: &children,
+        };
+        let mut c = Chrome::launch_with(&opts, start_chrome_on_a_port).expect("Chrome starts");
+        let page = c.new_page().expect("a tab");
+        let v = c
+            .evaluate(&page, "6 * 7", Duration::from_secs(10))
+            .expect("evaluates");
+        assert_eq!(v, json!(42));
+        c.close();
+        assert_eq!(children.running(), 0, "Chrome and its Xvfb are gone");
+    }
+
+    /// The pipe, against a real Chrome, and stopped from another thread the
+    /// way the plugin's cleanup does it. Needs Chrome.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn chrome_on_its_pipe_is_stopped_from_another_thread() {
+        let chrome = find_chrome().expect("Chrome is installed");
+        let profile = tempfile::tempdir().unwrap();
+        let children = Children::default();
+        let opts = Launch {
+            chrome: &chrome,
+            profile: profile.path(),
+            children: &children,
+        };
+        let mut c = Chrome::launch(&opts).expect("Chrome starts");
+        assert!(c.alive());
+        let stopper = children.clone();
+        std::thread::spawn(move || stopper.stop_all(Duration::from_secs(1)))
+            .join()
+            .unwrap();
+        assert!(!c.alive());
+        assert_eq!(children.running(), 0);
     }
 
     #[test]

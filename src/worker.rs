@@ -1,25 +1,36 @@
-//! The browser task: one Chrome for the plugin's whole life.
+//! The browser thread: one Chrome for the plugin's whole life.
 //!
-//! A call into the plugin's UI instance has ten seconds, and a page load can
-//! take thirty, so Chrome is driven from a host task ([`BROWSER_TASK`]), a
-//! second instance of the plugin. The UI sends it [`Job`]s through the task's
-//! inbox and it answers each with a [`Done`] (`tasks.emit`), JSON both ways.
-//! Natively (the tests) the same loop is a thread with channels.
+//! A call from the app has ten seconds, and a page load can take thirty, so
+//! Chrome is driven from a thread of its own. The UI sends it [`Job`]s over a
+//! channel and it answers each with a [`Done`], which the UI takes on its next
+//! `poll`. A page rendered for another program's link goes straight to the app
+//! from the thread (`host::page_rendered`).
 //!
 //! Jobs run one at a time, in the order they were sent. A navigation queued
 //! behind a newer one is skipped: the user has already typed past it.
+//!
+//! The [`Worker`] handle owns the thread: dropping it closes Chrome, and stops
+//! it (and its Xvfb) outright if the thread is busy with a load.
 
+use crate::cdp::Children;
 use crate::{LiveSession, PRUNE_HIDDEN};
 use serde::{Deserialize, Serialize};
 use sicompass_sdk::ffon::{FfonElement, FormMap, FormNode, FormNodeKind};
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::time::Duration;
 
-/// The task that drives Chrome.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub const BROWSER_TASK: &str = "browser";
+/// How long the browser thread gets to close Chrome itself when the plugin
+/// goes, before Chrome is stopped from outside. The app's runtime ends the
+/// process two seconds after letting it go, so this and [`STOP_GRACE`] stay
+/// well inside that.
+const CLOSE_GRACE: Duration = Duration::from_millis(1200);
 
-/// What the UI asks of the browser task.
+/// How long Chrome and Xvfb get to end after `SIGTERM`, before they are killed.
+const STOP_GRACE: Duration = Duration::from_millis(400);
+
+/// What the UI asks of the browser thread.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Job {
     /// Load `url` in the reader's tab. `seq` numbers the UI's navigations,
@@ -42,7 +53,7 @@ pub enum Job {
     Close,
 }
 
-/// What the browser task answers.
+/// What the browser thread answers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Done {
     /// A page for navigation `seq` (or, `submitted`, the page a form led to).
@@ -149,13 +160,15 @@ impl WirePage {
 }
 
 // ---------------------------------------------------------------------------
-// The task's side
+// The thread's side
 // ---------------------------------------------------------------------------
 
-/// What the browser task holds between jobs: Chrome and the reader's tab.
+/// What the browser thread holds between jobs: Chrome and the reader's tab.
 #[derive(Default)]
 pub struct WorkerState {
     live: Option<LiveSession>,
+    /// Every program this browser started, for stopping them from outside.
+    children: Children,
 }
 
 impl WorkerState {
@@ -167,7 +180,7 @@ impl WorkerState {
             self.live = None;
         }
         if self.live.is_none() {
-            self.live = Some(crate::init_live_session()?);
+            self.live = Some(crate::init_live_session(&self.children)?);
         }
         Ok(self.live.as_mut().expect("started above"))
     }
@@ -304,165 +317,123 @@ fn next_job(queue: &mut VecDeque<Job>) -> Option<Job> {
     }
 }
 
-/// Run one serialized job, answering a serialized result.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-fn serve(state: &mut WorkerState, job: Job) -> Option<Vec<u8>> {
-    let done = state.run(job)?;
-    serde_json::to_vec(&done).ok()
-}
-
-/// The browser task itself, in the sandbox: jobs from the inbox, answers
-/// emitted, until the plugin goes away.
-#[cfg(target_arch = "wasm32")]
-pub fn run_browser_task(_input: &[u8]) -> Result<Vec<u8>, String> {
-    use sicompass_pdk::tasks;
-    let mut state = WorkerState::default();
-    let mut queue: VecDeque<Job> = VecDeque::new();
-    let push = |bytes: Vec<u8>, queue: &mut VecDeque<Job>| {
-        if let Ok(job) = serde_json::from_slice(&bytes) {
-            queue.push_back(job);
-        }
-    };
-    while !tasks::cancelled() {
-        // Wait for work when there is none, then gather all that is waiting,
-        // so a navigation behind a newer one can be skipped.
-        if queue.is_empty()
-            && let Some(bytes) = tasks::receive(1000)
-        {
-            push(bytes, &mut queue);
-        }
-        while let Some(bytes) = tasks::receive(0) {
-            push(bytes, &mut queue);
-        }
-        let Some(job) = next_job(&mut queue) else {
-            continue;
-        };
-        let closing = matches!(job, Job::Close);
-        if let Some(done) = state.run(job)
-            && let Ok(bytes) = serde_json::to_vec(&done)
-        {
-            tasks::emit(&bytes);
-        }
-        if closing {
-            break;
+/// The browser thread itself: jobs in, answers out, until the UI's handle
+/// is dropped.
+fn run_browser_thread(mut state: WorkerState, jobs: Receiver<Job>, done: Sender<Done>) {
+    let mut queue = VecDeque::new();
+    while let Ok(job) = jobs.recv() {
+        queue.push_back(job);
+        queue.extend(jobs.try_iter());
+        while let Some(job) = next_job(&mut queue) {
+            let closing = matches!(job, Job::Close);
+            match state.run(job) {
+                // A page for another program's link goes to the app, which
+                // asked for it, without waiting for the UI's next poll.
+                Some(Done::Rendered { url, page }) => {
+                    let elements = sicompass_sdk::ffon::parse_json(&page).unwrap_or_default();
+                    sicompass_sdk::plugin::host::page_rendered(&url, &elements);
+                }
+                Some(answer) => {
+                    if done.send(answer).is_err() {
+                        return;
+                    }
+                }
+                None => {}
+            }
+            if closing {
+                return;
+            }
+            queue.extend(jobs.try_iter());
         }
     }
-    Ok(Vec::new())
 }
 
 // ---------------------------------------------------------------------------
 // The UI's side
 // ---------------------------------------------------------------------------
 
-/// The UI instance's handle on the browser task.
+/// The UI's handle on the browser thread.
 pub struct Worker {
-    #[cfg(not(target_arch = "wasm32"))]
-    jobs: std::sync::mpsc::Sender<Job>,
-    #[cfg(not(target_arch = "wasm32"))]
-    done: std::sync::mpsc::Receiver<Vec<u8>>,
-    #[cfg(target_arch = "wasm32")]
-    task: u64,
+    jobs: Sender<Job>,
+    done: Receiver<Done>,
+    /// Ends (disconnects) when the thread does.
+    finished: Receiver<()>,
+    /// What the thread started, stopped on drop whatever the thread is doing.
+    children: Children,
 }
 
 impl Worker {
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn start() -> Result<Worker, String> {
-        let (jobs, job_rx) = std::sync::mpsc::channel::<Job>();
-        let (done_tx, done) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (jobs, job_rx) = mpsc::channel::<Job>();
+        let (done_tx, done) = mpsc::channel::<Done>();
+        let (finished_tx, finished) = mpsc::channel::<()>();
+        let state = WorkerState::default();
+        let children = state.children.clone();
         std::thread::Builder::new()
             .name("webbrowser".to_owned())
             .spawn(move || {
-                let mut state = WorkerState::default();
-                let mut queue = VecDeque::new();
-                // Ends when the UI side (the sender) is dropped.
-                while let Ok(job) = job_rx.recv() {
-                    queue.push_back(job);
-                    queue.extend(job_rx.try_iter());
-                    while let Some(job) = next_job(&mut queue) {
-                        if let Some(answer) = serve(&mut state, job)
-                            && done_tx.send(answer).is_err()
-                        {
-                            return;
-                        }
-                        queue.extend(job_rx.try_iter());
-                    }
-                }
+                let _finished = finished_tx;
+                run_browser_thread(state, job_rx, done_tx);
             })
             .map_err(|e| e.to_string())?;
-        Ok(Worker { jobs, done })
+        Ok(Worker {
+            jobs,
+            done,
+            finished,
+            children,
+        })
     }
 
     /// A handle whose jobs go nowhere but the returned receiver, for tests
     /// of what the UI sends and how it takes answers, with no Chrome.
-    #[cfg(all(test, not(target_arch = "wasm32")))]
-    pub fn recording() -> (
-        Worker,
-        std::sync::mpsc::Receiver<Job>,
-        std::sync::mpsc::Sender<Vec<u8>>,
-    ) {
-        let (jobs, job_rx) = std::sync::mpsc::channel::<Job>();
-        let (done_tx, done) = std::sync::mpsc::channel::<Vec<u8>>();
-        (Worker { jobs, done }, job_rx, done_tx)
+    #[cfg(test)]
+    pub fn recording() -> (Worker, Receiver<Job>, Sender<Done>) {
+        let (jobs, job_rx) = mpsc::channel::<Job>();
+        let (done_tx, done) = mpsc::channel::<Done>();
+        let (_, finished) = mpsc::channel::<()>();
+        let worker = Worker {
+            jobs,
+            done,
+            finished,
+            children: Children::default(),
+        };
+        (worker, job_rx, done_tx)
     }
 
-    #[cfg(target_arch = "wasm32")]
-    pub fn start() -> Result<Worker, String> {
-        let task = sicompass_pdk::tasks::spawn(BROWSER_TASK, &[])?;
-        Ok(Worker { task })
-    }
-
-    /// Hand the browser task a job.
+    /// Hand the browser thread a job.
     pub fn send(&self, job: &Job) -> Result<(), String> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.jobs
-                .send(job.clone())
-                .map_err(|_| "the browser has stopped".to_owned())
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let bytes = serde_json::to_vec(job).map_err(|e| e.to_string())?;
-            sicompass_pdk::tasks::send(self.task, &bytes)
-        }
+        self.jobs
+            .send(job.clone())
+            .map_err(|_| "the browser has stopped".to_owned())
     }
 
-    /// What the browser task has finished since the last call (natively; in
-    /// the sandbox answers arrive through [`Worker::on_task_event`]).
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn drain(&self) -> Vec<Done> {
-        self.done
-            .try_iter()
-            .filter_map(|b| serde_json::from_slice(&b).ok())
-            .collect()
-    }
-
-    /// An event from the browser task: its answer, if it is one of its.
-    /// `Err` when the task ended, so the UI starts a new one.
-    #[cfg(target_arch = "wasm32")]
-    pub fn on_task_event(
-        &self,
-        id: u64,
-        event: &sicompass_pdk::TaskEvent,
-    ) -> Option<Result<Done, String>> {
-        if id != self.task {
-            return None;
-        }
-        match event {
-            sicompass_pdk::TaskEvent::Progress(b) => serde_json::from_slice(b).ok().map(Ok),
-            sicompass_pdk::TaskEvent::Done(r) => Some(Err(match r {
-                Ok(_) => "the browser stopped".to_owned(),
-                Err(e) => format!("the browser stopped: {e}"),
-            })),
+    /// What the browser thread has finished since the last call, and `false`
+    /// once the thread is gone (it will answer nothing more).
+    pub fn drain(&self) -> (Vec<Done>, bool) {
+        let mut out = Vec::new();
+        loop {
+            match self.done.try_recv() {
+                Ok(d) => out.push(d),
+                Err(TryRecvError::Empty) => return (out, true),
+                Err(TryRecvError::Disconnected) => return (out, false),
+            }
         }
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 impl Drop for Worker {
+    /// Close Chrome: the thread closes it itself when it is free to, and
+    /// whatever still runs after [`CLOSE_GRACE`] (the thread is in the middle
+    /// of a load) is stopped from here.
     fn drop(&mut self) {
-        // Let it close Chrome itself, then make sure it goes.
-        let _ = self.send(&Job::Close);
-        sicompass_pdk::tasks::cancel(self.task);
+        let _ = self.jobs.send(Job::Close);
+        if !matches!(
+            self.finished.recv_timeout(CLOSE_GRACE),
+            Err(RecvTimeoutError::Disconnected)
+        ) {
+            crate::cdp::log("the browser was busy when the plugin closed; stopping Chrome");
+        }
+        self.children.stop_all(STOP_GRACE);
     }
 }
 

@@ -1,8 +1,9 @@
 //! Web browser provider — Rust port of `lib_webbrowser/`.
 //!
-//! A sicompass WASM plugin. Fetches a URL via a real Chrome browser (driven
-//! over the DevTools protocol on a pipe, see `cdp`, from a host task, see
-//! `worker`, and kept off the user's screen on a virtual X display),
+//! A sicompass plugin: a program sicompass starts, with the user's rights.
+//! Fetches a URL via a real Chrome browser (driven over the DevTools protocol,
+//! see `cdp`, from a thread of its own, see `worker`, and kept off the user's
+//! screen, on a virtual X display or headless),
 //! parses the rendered HTML with scraper (html5ever), and converts the DOM to a
 //! flat FFON tree of strings and objects that mirrors the C provider's
 //! lexbor-based output.
@@ -35,10 +36,11 @@
 
 mod cdp;
 mod localize;
+mod program;
 mod worker;
 
-use sicompass_pdk::{Descriptor, Plugin, PollResult, export_plugin};
 use sicompass_sdk::ffon::{FfonElement, FormMap, FormNodeKind};
+use sicompass_sdk::plugin::{Descriptor, Plugin, PollResult};
 
 #[cfg(test)]
 use sicompass_sdk::ffon::html_to_ffon;
@@ -154,22 +156,22 @@ pub struct WebbrowserProvider {
     path_cache: String, // "/" or "/seg0/seg1/…", rebuilt on every push/pop
     cached_page: Option<CachedPage>,
     form_map: FormMap,
-    // The browser task (see `worker`), started on the first page load. A
+    // The browser thread (see `worker`), started on the first page load. A
     // cold Chrome launch is the single longest operation in the app, and it
     // never runs on the UI's call.
     worker: Option<worker::Worker>,
-    // Numbers the navigations sent to the browser task. An answer for an
+    // Numbers the navigations sent to the browser thread. An answer for an
     // older one is for a URL the user has already moved past, and is dropped.
     nav_seq: u64,
     // A navigation is loading: `fetch` shows "Loading…".
     loading: bool,
-    // Set when an answer from the browser task changed what `fetch` shows.
+    // Set when an answer from the browser thread changed what `fetch` shows.
     landed: bool,
     // Typed form values, replayed into a fresh Chrome at submit time.  Source
     // of truth for what the user has filled in between page-load and submit.
     // Cleared on URL navigation and after a successful submit-response render.
     form_field_values: HashMap<String, String>,
-    // Errors from the browser task (launch failures, network errors), drained
+    // Errors from the browser thread (launch failures, network errors), drained
     // by `take_error`.
     pending_error: Arc<Mutex<Option<String>>>,
     // Set when a URL navigation starts, consumed when its content lands: the
@@ -239,7 +241,7 @@ impl WebbrowserProvider {
         };
     }
 
-    /// Navigate to `url`: hand it to the browser task, which reuses the live
+    /// Navigate to `url`: hand it to the browser thread, which reuses the live
     /// Chrome (or starts one first). The page arrives through `tick`.
     fn load_url(&mut self, url: &str) {
         // URL is changing: any form values typed for the previous page are stale.
@@ -284,7 +286,7 @@ impl WebbrowserProvider {
         self.send_to_worker(&job);
     }
 
-    /// Hand the browser task `job`, starting it on first use. A task that
+    /// Hand the browser thread `job`, starting it on first use. A thread that
     /// cannot start reports why, as a failed load would.
     fn send_to_worker(&mut self, job: &worker::Job) {
         if self.worker.is_none() {
@@ -310,7 +312,7 @@ impl WebbrowserProvider {
         }
     }
 
-    /// Take an answer from the browser task.
+    /// Take an answer from the browser thread.
     fn apply_done(&mut self, done: worker::Done) {
         match done {
             worker::Done::Page {
@@ -357,24 +359,33 @@ impl WebbrowserProvider {
                 set_error(&self.pending_error, error);
                 self.landed = true;
             }
+            // The browser thread hands these to the app itself; one that
+            // reaches the UI goes the same way.
             worker::Done::Rendered { url, page } => {
                 let elements = sicompass_sdk::ffon::parse_json(&page).unwrap_or_default();
-                #[cfg(target_arch = "wasm32")]
-                sicompass_pdk::host::page_rendered(&url, &elements);
-                #[cfg(not(target_arch = "wasm32"))]
-                let _ = (url, elements);
+                sicompass_sdk::plugin::host::page_rendered(&url, &elements);
             }
         }
     }
 
-    /// Take what the native browser thread finished (in the sandbox answers
-    /// come through `on_task_event`).
+    /// Take what the browser thread finished. A thread that is gone (it
+    /// panicked) answers nothing more: the next job starts another, and a
+    /// load it had in flight is reported as failed rather than left loading.
     fn drain_worker(&mut self) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let done = self.worker.as_ref().map(|w| w.drain()).unwrap_or_default();
-            for d in done {
-                self.apply_done(d);
+        let Some(w) = &self.worker else {
+            return;
+        };
+        let (done, alive) = w.drain();
+        for d in done {
+            self.apply_done(d);
+        }
+        if !alive {
+            self.worker = None;
+            if self.loading {
+                self.apply_done(worker::Done::Failed {
+                    seq: self.nav_seq,
+                    error: "Error loading the page: the browser stopped".to_owned(),
+                });
             }
         }
     }
@@ -411,8 +422,8 @@ impl WebbrowserProvider {
         if test_no_history() {
             return None;
         }
-        // The plugin's storage folder. Natively (the tests) nowhere.
-        cfg!(target_arch = "wasm32").then(|| std::path::PathBuf::from("/storage").join("history"))
+        // The plugin's storage folder. Outside sicompass (the tests) nowhere.
+        sicompass_sdk::plugin::storage_dir().map(|d| d.join("history"))
     }
 
     /// Read every line of the history file, newest first, plus the set of URLs
@@ -912,10 +923,9 @@ impl WebbrowserProvider {
     }
 
     pub fn cleanup(&mut self) {
-        // Close Chrome cleanly. Dropping the handle ends the browser task.
-        if let Some(w) = self.worker.take() {
-            let _ = w.send(&worker::Job::Close);
-        }
+        // Dropping the handle closes Chrome, and stops it (and its Xvfb)
+        // outright if the browser thread is busy with a load.
+        self.worker.take();
     }
 
     pub fn commands(&self) -> Vec<String> {
@@ -1025,7 +1035,7 @@ impl WebbrowserProvider {
 
     /// Clear all cookies from the persistent profile: over CDP when Chrome is
     /// running (which also empties the backing store), and from the profile
-    /// on disk when it is not. The browser task does either.
+    /// on disk when it is not. The browser thread does either.
     fn clear_cookies(&mut self, _error: &mut String) {
         self.send_to_worker(&worker::Job::ClearCookies);
     }
@@ -1270,8 +1280,8 @@ fn secs(n: u64) -> std::time::Duration {
 
 /// Open the live session: launch Chrome, open a tab, and inject the stealth
 /// script so it applies to every page load.
-fn init_live_session() -> Result<LiveSession, String> {
-    let mut chrome = launch_browser()?;
+fn init_live_session(children: &cdp::Children) -> Result<LiveSession, String> {
+    let mut chrome = launch_browser(children)?;
     let page = chrome
         .new_page()
         .map_err(|e| format!("failed to open tab: {e}"))?;
@@ -1308,7 +1318,7 @@ fn navigate_and_get_html(
 }
 
 // ---------------------------------------------------------------------------
-// Chrome, started from the browser task and kept off the user's screen
+// Chrome, started from the browser thread and kept off the user's screen
 // ---------------------------------------------------------------------------
 
 /// A running Chrome and the tab the user's pages load in.
@@ -1318,35 +1328,30 @@ struct LiveSession {
 }
 
 /// Where Chrome keeps its profile, so cookies and logins survive restarts:
-/// `(folder, profile name in it)`. The folder is Chrome's working directory
-/// and the profile path is relative to it, because Chrome runs outside the
-/// sandbox: the host maps `/storage/...` onto the plugin's real storage
-/// folder for the working directory, which is the only path it translates.
-/// Natively (the live tests) a throwaway folder per run.
+/// `(folder, profile name in it)`, the folder being `chrome` in the plugin's
+/// storage folder. Outside sicompass (the live tests) a throwaway folder per
+/// run.
 fn chrome_profile() -> (String, &'static str) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        (format!("{}/chrome", sicompass_pdk::STORAGE_DIR), "profile")
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let dir = std::env::temp_dir().join(format!("sicompass-webbrowser-{}", std::process::id()));
-        (dir.to_string_lossy().into_owned(), "profile")
-    }
+    let dir = sicompass_sdk::plugin::storage_dir()
+        .map(|d| d.join("chrome"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("sicompass-webbrowser-{}", std::process::id()))
+        });
+    (dir.to_string_lossy().into_owned(), "profile")
 }
 
 /// Start Chrome on the persistent profile, clearing a stale lock a crashed
-/// Chrome left behind.
-fn launch_browser() -> Result<cdp::Chrome, String> {
+/// Chrome left behind. Chrome and its Xvfb are registered in `children`.
+fn launch_browser(children: &cdp::Children) -> Result<cdp::Chrome, String> {
     let chrome = cdp::find_chrome().ok_or_else(cdp::chrome_missing_message)?;
     let (parent, name) = chrome_profile();
     let profile = std::path::Path::new(&parent).join(name);
     let _ = std::fs::create_dir_all(&profile);
     let _ = std::fs::remove_file(profile.join("SingletonLock"));
     cdp::Chrome::launch(&cdp::Launch {
-        chrome,
-        profile_parent: &parent,
-        profile: name,
+        chrome: &chrome,
+        profile: &profile,
+        children,
     })
 }
 
@@ -1769,7 +1774,7 @@ fn page_to_ffon_with_forms(load: &PageLoad, url: &str) -> (Vec<FfonElement>, For
 
 /// Render `url` for a link another program shows, in a tab of its own in the
 /// live Chrome (so the reader's own tab stays where it is), and return it as
-/// FFON. The answer to the host's `sicompass:render-url`.
+/// FFON. The answer to the app's `render_url`.
 fn render_page(chrome: &mut cdp::Chrome, url: &str) -> Vec<FfonElement> {
     match fetch_page(chrome, url) {
         Ok(load) => page_to_ffon_with_forms(&load, url).0,
@@ -4434,7 +4439,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_chromium_fetches_real_cloudflare_site() {
-        let mut live = init_live_session().expect("launch chrome");
+        let mut live = init_live_session(&Default::default()).expect("launch chrome");
         let result = fetch_page(&mut live.chrome, "https://www.gva.be");
         live.chrome.close();
         assert!(result.is_ok(), "fetch failed: {:?}", result.err());
@@ -4532,7 +4537,7 @@ mod tests {
         );
     }
 
-    /// A page for the navigation the provider is on, as the browser task
+    /// A page for the navigation the provider is on, as the browser thread
     /// answers it.
     fn page_done(p: &WebbrowserProvider, text: &str, submitted: bool) -> worker::Done {
         worker::Done::Page {
@@ -4545,7 +4550,7 @@ mod tests {
     #[test]
     fn provider_tick_drains_ready_content() {
         let mut p = WebbrowserProvider::new();
-        // The browser task delivering content.
+        // The browser thread delivering content.
         p.apply_done(page_done(&p, "result", false));
         assert!(p.tick(), "tick should return true when content is ready");
         assert!(
@@ -4651,7 +4656,7 @@ mod tests {
     #[test]
     fn url_committed_during_a_load_is_queued_not_dropped() {
         // A load is already running. Committing a second URL hands the
-        // destination to the browser task, which runs it after (or instead of)
+        // destination to the browser thread, which runs it after (or instead of)
         // the first. Before the queue existed, the second page never loaded.
         let _flag = launch_flag_guard(false);
         let mut p = WebbrowserProvider::new();
@@ -4670,7 +4675,7 @@ mod tests {
         assert_eq!(
             sent,
             ["https://first.example/", "https://second.example/"],
-            "the URL has to reach the browser task, or nothing ever loads it"
+            "the URL has to reach the browser thread, or nothing ever loads it"
         );
         assert_eq!(
             p.current_url, "https://second.example/",
@@ -4682,7 +4687,7 @@ mod tests {
     #[test]
     fn a_page_for_a_url_typed_past_is_never_shown() {
         // Typing past a URL should not show its page when it lands late: the
-        // task skips a navigation queued behind a newer one (see `worker`),
+        // thread skips a navigation queued behind a newer one (see `worker`),
         // and an answer that was already on its way is dropped here, or it
         // would be cached under the newer URL now in the URL bar.
         let _flag = launch_flag_guard(false);
@@ -4703,6 +4708,26 @@ mod tests {
         assert_eq!(
             p.cached_page.as_ref().and_then(|c| c.elements[0].as_str()),
             Some("second page")
+        );
+    }
+
+    #[test]
+    fn a_browser_thread_that_died_fails_the_load_instead_of_loading_forever() {
+        let _flag = launch_flag_guard(false);
+        let mut p = WebbrowserProvider::new();
+        let (w, _jobs, answers) = worker::Worker::recording();
+        p.worker = Some(w);
+        p.load_url("https://first.example/");
+        assert!(p.loading);
+        // The thread is gone: nothing will ever answer.
+        drop(answers);
+        assert!(p.tick(), "the failure is something to show");
+        assert!(!p.loading, "no more \"Loading…\"");
+        assert!(p.worker.is_none(), "the next job starts another thread");
+        assert!(
+            p.take_error()
+                .is_some_and(|e| e.contains("the browser stopped")),
+            "and the status line says why"
         );
     }
 
@@ -6247,7 +6272,7 @@ mod tests {
     fn clearing_cookies_never_touches_real_files_under_test() {
         // With no Chrome running, `clear cookies` removes the cookie files
         // from the profile on disk, and the command tests below invoke it.
-        // Natively that profile is a throwaway under the temp folder, never
+        // Outside sicompass that profile is a throwaway under the temp folder, never
         // the developer's own.
         let (parent, _) = chrome_profile();
         assert!(
@@ -6303,7 +6328,7 @@ mod tests {
         let path = std::env::temp_dir().join(name);
         std::fs::write(&path, html).expect("write fixture");
         let url = format!("file://{}", path.display());
-        let mut live = init_live_session().expect("launch chrome");
+        let mut live = init_live_session(&Default::default()).expect("launch chrome");
         let out = navigate_and_get_html(&mut live.chrome, &live.page, &url);
         live.chrome.close();
         let _ = std::fs::remove_file(&path);
@@ -6318,7 +6343,7 @@ mod tests {
         let path = std::env::temp_dir().join(name);
         std::fs::write(&path, html).expect("write fixture");
         let url = format!("file://{}", path.display());
-        let mut live = init_live_session().expect("launch chrome");
+        let mut live = init_live_session(&Default::default()).expect("launch chrome");
         let _ = navigate_and_get_html(&mut live.chrome, &live.page, &url);
         let out = live
             .chrome
@@ -7035,7 +7060,7 @@ mod tests {
     #[test]
     #[ignore]
     fn live_google_consent_offers_both_choices() {
-        let mut live = init_live_session().expect("launch chrome");
+        let mut live = init_live_session(&Default::default()).expect("launch chrome");
         let loaded = navigate_and_get_html(&mut live.chrome, &live.page, "https://www.google.com/");
         live.chrome.close();
         let loaded = loaded.expect("navigate_and_get_html should not fail");
@@ -7310,9 +7335,8 @@ impl Plugin for WebbrowserProvider {
     }
 
     fn init(&mut self) {
-        // The declared settings, from the host.
-        #[cfg(target_arch = "wasm32")]
-        if let Some(v) = sicompass_pdk::host::get_setting("urlHistorySize") {
+        // The declared settings, from the app.
+        if let Some(v) = sicompass_sdk::plugin::host::get_setting("urlHistorySize") {
             WebbrowserProvider::on_setting_change(self, "urlHistorySize", &v);
         }
         WebbrowserProvider::init(self);
@@ -7322,7 +7346,7 @@ impl Plugin for WebbrowserProvider {
         WebbrowserProvider::cleanup(self);
     }
 
-    /// A page from the browser task asks for a redraw, a navigation that
+    /// A page from the browser thread asks for a redraw, a navigation that
     /// landed for the descent into it, and errors are reported.
     fn poll(&mut self) -> PollResult {
         let redraw = self.tick();
@@ -7331,7 +7355,8 @@ impl Plugin for WebbrowserProvider {
             redraw,
             at_root: self.path_segments.is_empty() && self.path_cache == "/",
             error: self.take_error(),
-            navigation_request: enter.then_some(sicompass_pdk::NavigationRequest::EnterChildren),
+            navigation_request: enter
+                .then_some(sicompass_sdk::plugin::NavigationRequest::EnterChildren),
             ..Default::default()
         }
     }
@@ -7388,7 +7413,7 @@ impl Plugin for WebbrowserProvider {
     }
 
     /// A page another program links to: rendered in a tab of its own in the
-    /// live Chrome, and handed to the host when it is ready.
+    /// live Chrome, and handed to the app when it is ready.
     fn render_url(&mut self, url: &str) -> bool {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return false;
@@ -7399,43 +7424,7 @@ impl Plugin for WebbrowserProvider {
         });
         true
     }
-
-    fn run_task(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, String> {
-        match name {
-            #[cfg(target_arch = "wasm32")]
-            worker::BROWSER_TASK => worker::run_browser_task(input),
-            other => {
-                let _ = input;
-                Err(format!("webbrowser has no task named `{other}`"))
-            }
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn on_task_event(&mut self, id: u64, event: sicompass_pdk::TaskEvent) {
-        let answer = self
-            .worker
-            .as_ref()
-            .and_then(|w| w.on_task_event(id, &event));
-        match answer {
-            Some(Ok(done)) => self.apply_done(done),
-            Some(Err(e)) => {
-                // The task is gone; the next job starts another. A load it had
-                // in flight is not coming.
-                self.worker = None;
-                if self.loading {
-                    self.apply_done(worker::Done::Failed {
-                        seq: self.nav_seq,
-                        error: e,
-                    });
-                }
-            }
-            None => {}
-        }
-    }
 }
-
-export_plugin!(WebbrowserProvider);
 
 /// The tutorial's paragraphs about this plugin are the plugin's own:
 /// `webbrowser-tutorial`, then `webbrowser-tutorial-2` and so on. The tutorial reads them
@@ -7473,7 +7462,16 @@ mod tutorial_text_tests {
     #[test]
     fn every_language_has_the_same_tutorial_leaves() {
         let en = tutorial_ids(LOCALES[0].1);
-        assert_eq!(en, ["webbrowser-tutorial", "webbrowser-tutorial-2", "webbrowser-tutorial-3", "webbrowser-tutorial-4"], "en-US's tutorial leaves");
+        assert_eq!(
+            en,
+            [
+                "webbrowser-tutorial",
+                "webbrowser-tutorial-2",
+                "webbrowser-tutorial-3",
+                "webbrowser-tutorial-4"
+            ],
+            "en-US's tutorial leaves"
+        );
         for (locale, ftl) in &LOCALES[1..] {
             assert_eq!(tutorial_ids(ftl), en, "{locale} has drifted from en-US");
         }
@@ -7495,7 +7493,10 @@ mod tutorial_text_tests {
         );
         // The colon commands a reader cannot otherwise guess at.
         for cmd in ["clear cookies", "show hidden content"] {
-            assert!(text.contains(cmd), "must document the {cmd} command, got:\n{text}");
+            assert!(
+                text.contains(cmd),
+                "must document the {cmd} command, got:\n{text}"
+            );
         }
     }
 }
