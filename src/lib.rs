@@ -1281,6 +1281,7 @@ fn secs(n: u64) -> std::time::Duration {
 /// Open the live session: launch Chrome, open a tab, and inject the stealth
 /// script so it applies to every page load.
 fn init_live_session(children: &cdp::Children) -> Result<LiveSession, String> {
+    let profile_lock = lock_profile()?;
     let mut chrome = launch_browser(children)?;
     let page = chrome
         .new_page()
@@ -1289,7 +1290,11 @@ fn init_live_session(children: &cdp::Children) -> Result<LiveSession, String> {
         .add_script_on_new_document(&page, STEALTH_SCRIPT)
         .map_err(|e| format!("stealth script injection failed: {e}"))?;
     chrome.set_desktop_viewport(&page);
-    Ok(LiveSession { chrome, page })
+    Ok(LiveSession {
+        chrome,
+        page,
+        _profile_lock: profile_lock,
+    })
 }
 
 /// Navigate the tab to `url` and return the settled page.
@@ -1325,6 +1330,8 @@ fn navigate_and_get_html(
 struct LiveSession {
     chrome: cdp::Chrome,
     page: cdp::Page,
+    /// The profile is this Chrome's for as long as the session lives.
+    _profile_lock: std::fs::File,
 }
 
 /// Where Chrome keeps its profile, so cookies and logins survive restarts:
@@ -1340,8 +1347,37 @@ fn chrome_profile() -> (String, &'static str) {
     (dir.to_string_lossy().into_owned(), "profile")
 }
 
+/// Take the lock on Chrome's profile, held for as long as this plugin's Chrome
+/// runs.
+///
+/// Every tab runs its own copy of this plugin, and two Chromes on one profile
+/// corrupt it, so the second tab finds the lock taken and says so instead of
+/// starting a Chrome of its own. The OS releases the lock when this process
+/// ends, however it ends, so a crash never leaves the profile locked.
+fn lock_profile() -> Result<std::fs::File, String> {
+    let (parent, _) = chrome_profile();
+    let parent = std::path::Path::new(&parent);
+    std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    let path = parent.join("profile.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(localize::t("webbrowser-profile-in-use")),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!(
+            "cannot lock the browser profile {}: {e}",
+            path.display()
+        )),
+    }
+}
+
 /// Start Chrome on the persistent profile, clearing a stale lock a crashed
-/// Chrome left behind. Chrome and its Xvfb are registered in `children`.
+/// Chrome left behind: [`lock_profile`] already made sure no other Chrome of
+/// ours is on it. Chrome and its Xvfb are registered in `children`.
 fn launch_browser(children: &cdp::Children) -> Result<cdp::Chrome, String> {
     let chrome = cdp::find_chrome().ok_or_else(cdp::chrome_missing_message)?;
     let (parent, name) = chrome_profile();
@@ -3494,6 +3530,19 @@ fn await_stable_url(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second copy of the plugin (another tab) finds the profile taken, and
+    /// says so, until the first one lets it go. The lock is per open file, so
+    /// two takes in one process stand in for two processes.
+    #[test]
+    fn a_second_tab_finds_the_profile_taken_until_the_first_lets_go() {
+        let first = lock_profile().expect("the profile is free");
+        let err = lock_profile().expect_err("the profile is taken");
+        assert_eq!(err, localize::t("webbrowser-profile-in-use"));
+        assert!(err.contains("another tab"), "{err}");
+        drop(first);
+        lock_profile().expect("free again once the first lets go");
+    }
 
     /// Serialises the tests that depend on `TEST_NO_LAUNCH`.
     ///
