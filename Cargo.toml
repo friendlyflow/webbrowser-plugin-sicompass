@@ -3,7 +3,7 @@
 
 [package]
 name = "webbrowser-plugin"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "A web browser for sicompass: pages as lists, rendered by Chrome, as a plugin"
