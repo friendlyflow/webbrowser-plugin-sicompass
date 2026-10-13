@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.2
+
+- On Windows, a Chrome left running on the plugin's profile is ended, and Chrome no longer outlives the plugin, so the browser starts again.
+
 ## 0.3.1
 
 - Maintenance release. Nothing changes in the plugin itself.

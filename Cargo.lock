@@ -740,9 +740,9 @@ dependencies = [
 
 [[package]]
 name = "sicompass-sdk"
-version = "0.9.1"
+version = "0.9.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87268b7bdc44757a5612bb692d9771ae7d60787ebfedbe969895c8a8329fd00b"
+checksum = "6b2b9c4c4ad66f10ee7291b9b4a22126f3a139ebcb7bb7542a404d610e68c285"
 dependencies = [
  "async-trait",
  "libc",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "webbrowser-plugin"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "libc",
  "scraper",
