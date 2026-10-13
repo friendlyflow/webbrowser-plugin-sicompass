@@ -271,6 +271,221 @@ fn kill(child: &Shared) {
     let _ = c.wait();
 }
 
+/// Never leaving a Chrome behind on Windows, which has neither of the two nets
+/// the other platforms get for free.
+///
+/// On Unix Chrome exits when its `--remote-debugging-pipe` closes, and on Linux
+/// `PR_SET_PDEATHSIG` ends it with the thread that started it, so a plugin that
+/// dies without running a destructor still takes Chrome with it. Windows speaks
+/// the protocol over a TCP socket instead, and closing that means nothing to
+/// Chrome: a plugin killed outright (the app crashed, the user ended the task)
+/// left a headless Chrome running forever, holding the profile.
+///
+/// That mattered because a *second* Chrome on one `--user-data-dir` does not
+/// start: it hands its command line to the one already there and exits at once,
+/// writing no `DevToolsActivePort` and nothing on stderr. The browser then
+/// reported "Chrome exited before it opened its DevTools port" on every page
+/// load, for good, until the stray `chrome.exe` was ended by hand.
+///
+/// A job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is the Windows
+/// equivalent: the handle lives in this process, so when this process ends,
+/// however it ends, the OS closes it and kills everything in the job. Chrome's
+/// own helper processes are in it too, which `Child::kill` alone never reached.
+#[cfg(windows)]
+mod job {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use std::sync::OnceLock;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> *mut c_void;
+        fn SetInformationJobObject(
+            job: *mut c_void,
+            class: u32,
+            info: *const c_void,
+            len: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+    }
+
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    /// `JobObjectExtendedLimitInformation`.
+    const EXTENDED_LIMIT_INFORMATION: u32 = 9;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedLimitInformation {
+        basic_limit_information: BasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    /// The handle is deliberately never closed: holding it for the life of the
+    /// process is what arms kill-on-close.
+    struct Job(*mut c_void);
+    // SAFETY: a job handle is not bound to a thread, and nothing here mutates
+    // through the pointer after creation.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    /// The one job every program this plugin starts is put in, made on first
+    /// use. `None` when Windows refused, which only costs us the net.
+    fn job() -> Option<&'static Job> {
+        static JOB: OnceLock<Option<Job>> = OnceLock::new();
+        JOB.get_or_init(|| {
+            // SAFETY: an unnamed job with default security attributes.
+            let handle = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+            if handle.is_null() {
+                return None;
+            }
+            let mut info = ExtendedLimitInformation::default();
+            info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `info` is the struct `EXTENDED_LIMIT_INFORMATION` names,
+            // and its own size is passed.
+            let set = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    EXTENDED_LIMIT_INFORMATION,
+                    (&raw const info).cast(),
+                    size_of::<ExtendedLimitInformation>() as u32,
+                )
+            };
+            (set != 0).then_some(Job(handle))
+        })
+        .as_ref()
+    }
+
+    /// Put `child` in the job, so it cannot outlive this process. Best effort:
+    /// a failure leaves the child running normally, stopped by `Proc::drop` as
+    /// before.
+    pub fn adopt(child: &Child) {
+        let Some(job) = job() else { return };
+        // SAFETY: `child` has not been reaped, so its handle is open for as
+        // long as this call.
+        unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle().cast()) };
+    }
+}
+
+/// Finding, and ending, a Chrome of ours that holds the profile when it left
+/// no `DevToolsActivePort` to be asked through.
+///
+/// Every Chrome on a `--user-data-dir` owns a hidden `Chrome_MessageWindow`
+/// named after that folder, which is how a second Chrome finds it, hands its
+/// command line over and exits. Builds before `job` stranded Chromes whose port
+/// file the next launch then deleted, so the window is the one thing left to
+/// find them by. One found running for days on a real machine had exactly
+/// this shape.
+///
+/// Only reached with the profile lock held (`lock_profile`, taken before every
+/// launch), so no live tab of ours has a Chrome on this profile: whatever owns
+/// the window is one that outlived its plugin. The folder is the plugin's own,
+/// so no other program's Chrome is ever named after it.
+#[cfg(windows)]
+mod singleton {
+    use std::ffi::{OsStr, c_void};
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn FindWindowW(class: *const u16, name: *const u16) -> *mut c_void;
+        fn GetWindowThreadProcessId(window: *mut c_void, pid: *mut u32) -> u32;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn TerminateProcess(process: *mut c_void, code: u32) -> i32;
+        fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
+    fn wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// The process holding `profile`'s singleton, if any. Window names compare
+    /// case-insensitively, as Windows paths do.
+    fn holder(profile: &Path) -> Option<u32> {
+        let class = wide(OsStr::new("Chrome_MessageWindow"));
+        let name = wide(profile.as_os_str());
+        // SAFETY: both strings are NUL-terminated and outlive the call.
+        let window = unsafe { FindWindowW(class.as_ptr(), name.as_ptr()) };
+        if window.is_null() {
+            return None;
+        }
+        let mut pid = 0;
+        // SAFETY: `window` came from FindWindowW, and `pid` lives on this frame.
+        unsafe { GetWindowThreadProcessId(window, &mut pid) };
+        (pid != 0 && pid != std::process::id()).then_some(pid)
+    }
+
+    #[cfg(test)]
+    pub fn holder_for_test(profile: &Path) -> Option<u32> {
+        holder(profile)
+    }
+
+    /// Make sure no Chrome holds `profile`: give one that was just asked to
+    /// close `grace` to go by itself, then end it, and wait for it to let go.
+    /// True when there was one to end.
+    pub fn end_the_chrome_holding(profile: &Path, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        let pid = loop {
+            match holder(profile) {
+                None => return false,
+                Some(pid) if Instant::now() >= deadline => break pid,
+                Some(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        // SAFETY: handle calls on one pid; the handle is closed before return.
+        unsafe {
+            let process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid);
+            if process.is_null() {
+                return false;
+            }
+            TerminateProcess(process, 1);
+            // Gone, and the singleton with it, before the next Chrome looks.
+            WaitForSingleObject(process, 5_000);
+            CloseHandle(process);
+        }
+        true
+    }
+}
+
 /// A started program: Chrome, or Xvfb.
 pub struct Proc {
     child: Shared,
@@ -356,6 +571,12 @@ impl Proc {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("cannot start `{}`: {e}", program.display()))?;
+        // Windows' stand-in for `PR_SET_PDEATHSIG` and the pipe that ends
+        // Chrome when it closes, both of which it has not got (see `job`).
+        // Right after `spawn`, so the browser process is in the job before it
+        // has had time to take the profile's singleton.
+        #[cfg(windows)]
+        job::adopt(&child);
         let stdout = child.stdout.take().map(reader);
         let stderr = child.stderr.take().map(reader);
         let child = Arc::new(Mutex::new(child));
@@ -917,6 +1138,34 @@ fn start_chrome_on_a_port(
     unset: &[String],
 ) -> Result<(Proc, Channel), String> {
     let port_file = opts.profile.join("DevToolsActivePort");
+    // Read before it is removed: a Chrome of ours stranded by a plugin that
+    // was killed outright still answers on the port it recorded there, and it
+    // has to go before this one can start (see `close_a_stranded_chrome`).
+    // `job` keeps that from happening again, but every Chrome left behind by a
+    // build without it is still out there holding the profile.
+    let recorded = std::fs::read_to_string(&port_file)
+        .ok()
+        .and_then(|t| parse_devtools_active_port(&t));
+    let asked = recorded.is_some();
+    if let Some((port, path)) = recorded {
+        close_a_stranded_chrome(port, &path);
+    }
+    // And one with no port file left to ask through, or that did not go when
+    // asked, by the window Chrome keeps for its profile. A Chrome just asked to
+    // close gets a moment first, so it can save the user's cookies.
+    #[cfg(windows)]
+    if singleton::end_the_chrome_holding(
+        opts.profile,
+        if asked {
+            Duration::from_secs(3)
+        } else {
+            Duration::ZERO
+        },
+    ) {
+        log("ended a Chrome left behind on the browser profile");
+    }
+    #[cfg(not(windows))]
+    let _ = asked;
     // One left by an earlier Chrome names a port nobody listens on.
     let _ = std::fs::remove_file(&port_file);
     let mut proc = Proc::start(
@@ -937,10 +1186,16 @@ fn start_chrome_on_a_port(
             break found;
         }
         if proc.exited() {
-            return Err("Chrome exited before it opened its DevTools port".to_owned());
+            return Err(format!(
+                "Chrome exited before it opened its DevTools port{}",
+                why_it_might_have_exited(&mut proc)
+            ));
         }
         if Instant::now() >= deadline {
-            return Err("Chrome opened no DevTools port".to_owned());
+            return Err(format!(
+                "Chrome opened no DevTools port{}",
+                why_it_might_have_exited(&mut proc)
+            ));
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -957,6 +1212,69 @@ fn start_chrome_on_a_port(
     )
     .map_err(|e| format!("Chrome's DevTools websocket: {e}"))?;
     Ok((proc, Channel::socket(ws)?))
+}
+
+/// What to add to a "Chrome did not open its port" message. Chrome says why on
+/// its stderr when it has a reason (an unwritable profile, a switch it refuses),
+/// and says nothing at all when it merely handed its command line to a Chrome
+/// already on the profile, so the absence is worth reading too.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn why_it_might_have_exited(proc: &mut Proc) -> String {
+    let stderr = String::from_utf8_lossy(&proc.stderr()).into_owned();
+    let tail: Vec<&str> = stderr
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .collect();
+    if tail.is_empty() {
+        // Nothing on stderr and gone at once is what the profile's singleton
+        // looks like from here, so name it: it is the one cause the user can
+        // do something about.
+        " and said nothing, which is what a Chrome already running on this \
+         profile looks like. Close any leftover Chrome and try again."
+            .to_owned()
+    } else {
+        format!(
+            ": {}",
+            tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
+        )
+    }
+}
+
+/// Ask a Chrome of ours that outlived its plugin to close, so this one can have
+/// the profile. `port` and `path` are what it recorded in `DevToolsActivePort`.
+///
+/// Best effort and quiet: the port may be free, taken by something else, or
+/// held by a Chrome that is already going. Nothing here is fatal, because the
+/// launch that follows reports the real failure anyway. Only a peer that
+/// completes a DevTools websocket handshake on the path Chrome wrote is spoken
+/// to, and that file lives inside our own profile folder.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn close_a_stranded_chrome(port: u16, path: &str) {
+    let Ok(stream) = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(500),
+    ) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let Ok((mut ws, _)) =
+        tungstenite::client::client(format!("ws://127.0.0.1:{port}{path}"), stream)
+    else {
+        return;
+    };
+    log("closing a Chrome left behind on the browser profile");
+    let _ = ws.send(tungstenite::Message::Text(
+        json!({"id": 1, "method": "Browser.close", "params": {}})
+            .to_string()
+            .into(),
+    ));
+    let _ = ws.flush();
+    // It stops answering as it goes; a read is only to let it get there.
+    let _ = ws.read();
+    let _ = ws.close(None);
 }
 
 /// Start Xvfb on a display of its choosing (`-displayfd 1`: it writes the
@@ -1195,6 +1513,82 @@ mod tests {
         assert_eq!(v, json!(42));
         c.close();
         assert_eq!(children.running(), 0, "Chrome and its Xvfb are gone");
+    }
+
+    /// A Chrome that outlived its plugin does not block the next one.
+    ///
+    /// This is the Windows failure the job object now prevents and
+    /// `close_a_stranded_chrome` still has to clear up after: a second Chrome
+    /// on one profile hands its command line over and exits at once, so
+    /// without the reclaim the second launch here fails with "Chrome exited
+    /// before it opened its DevTools port". The first Chrome is leaked on
+    /// purpose, the way a killed plugin leaks one; the job object ends it with
+    /// this test process. Needs Chrome.
+    #[test]
+    #[ignore]
+    fn a_chrome_left_on_the_profile_is_closed_so_the_next_one_can_start() {
+        let chrome = find_chrome().expect("Chrome is installed");
+        let profile = tempfile::tempdir().unwrap();
+        let children = Children::default();
+        let opts = Launch {
+            chrome: &chrome,
+            profile: profile.path(),
+            children: &children,
+        };
+
+        let stranded = Chrome::launch_with(&opts, start_chrome_on_a_port).expect("Chrome starts");
+        assert!(
+            profile.path().join("DevToolsActivePort").exists(),
+            "Chrome recorded the port the reclaim reads"
+        );
+        // Not dropped and not closed: exactly what a plugin killed outright
+        // leaves behind.
+        std::mem::forget(stranded);
+
+        let mut next = Chrome::launch_with(&opts, start_chrome_on_a_port)
+            .expect("the second Chrome starts once the stranded one is closed");
+        let page = next.new_page().expect("a tab");
+        let v = next
+            .evaluate(&page, "6 * 7", Duration::from_secs(10))
+            .expect("evaluates");
+        assert_eq!(v, json!(42));
+        next.close();
+    }
+
+    /// The same, for a Chrome whose `DevToolsActivePort` is already gone, so
+    /// there is no port to ask it through: what builds before the job object
+    /// left behind, because each later launch deleted the file first. It is
+    /// found by its profile's singleton window instead. Needs Chrome.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn a_chrome_left_with_no_port_file_is_found_by_its_window() {
+        let chrome = find_chrome().expect("Chrome is installed");
+        let profile = tempfile::tempdir().unwrap();
+        let children = Children::default();
+        let opts = Launch {
+            chrome: &chrome,
+            profile: profile.path(),
+            children: &children,
+        };
+
+        let stranded = Chrome::launch_with(&opts, start_chrome_on_a_port).expect("Chrome starts");
+        std::mem::forget(stranded);
+        std::fs::remove_file(profile.path().join("DevToolsActivePort"))
+            .expect("the port file is there to delete");
+        assert!(
+            singleton::holder_for_test(profile.path()).is_some(),
+            "the stranded Chrome is found by its window"
+        );
+
+        let mut next = Chrome::launch_with(&opts, start_chrome_on_a_port)
+            .expect("the second Chrome starts once the stranded one is ended");
+        let page = next.new_page().expect("a tab");
+        let v = next
+            .evaluate(&page, "6 * 7", Duration::from_secs(10))
+            .expect("evaluates");
+        assert_eq!(v, json!(42));
+        next.close();
     }
 
     /// The pipe, against a real Chrome, and stopped from another thread the
