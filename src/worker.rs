@@ -281,9 +281,9 @@ impl WorkerState {
                 PRUNE_HIDDEN.store(prune, Ordering::Release);
                 let page = match self.live() {
                     Ok(live) => crate::render_page(&mut live.chrome, &url),
-                    Err(e) => vec![FfonElement::new_str(format!(
+                    Err(e) => vec![FfonElement::new_str(sicompass_sdk::tags::escape(&format!(
                         "Error launching browser: {e}"
-                    ))],
+                    )))],
                 };
                 Some(Done::Rendered {
                     page: sicompass_sdk::ffon::to_json_string(&page).unwrap_or_default(),

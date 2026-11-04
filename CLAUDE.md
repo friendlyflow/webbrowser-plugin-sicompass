@@ -72,6 +72,10 @@ Chrome is never driven from a call:
   (`sicompass_sdk::plugin::storage_dir`), and **the URL history** is `history`
   there. Outside sicompass (the tests) the profile is a throwaway folder under
   the temp folder and the history is never written (`TEST_NO_HISTORY`).
+- **Rows are markup** (`"markup": true`), and a page comes from a stranger. Every
+  page goes through `shield::html_to_rows`, never the SDK's walker directly, and any
+  other row with outside text in it goes through `tags::escape`. A `<link>` value
+  goes through `shield::link_value` instead, because the app follows it raw.
 - **Strings** come from the app (`host::translate`). The unit tests run
   outside sicompass and read the English bundle instead (`src/localize.rs`).
 - stdout is the channel to the app. `println!` lands in stderr, the app's log.

@@ -20,12 +20,12 @@ path = "src/main.rs"
 [dependencies]
 # The plugin kit (`plugin`) and the FFON model (with the HTML walker the pages
 # go through), from crates.io.
-sicompass-sdk = { version = "0.9.1", default-features = false, features = ["plugin"] }
+sicompass-sdk = { version = "0.9.12", default-features = false, features = ["plugin"] }
 serde = { version = "1", features = ["derive"] }
 # The DevTools protocol is JSON.
 serde_json = "1"
 # Reading `<link rel="alternate" hreflang>` out of `<head>`, which the SDK
-# walker skips whole. Same version the SDK already pulls in.
+# walker skips whole.
 scraper = "0.27"
 # The DevTools protocol over a websocket on 127.0.0.1, where Chrome has no
 # pipe to speak it on (Windows). Plain `ws://`, so no TLS.

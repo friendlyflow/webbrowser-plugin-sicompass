@@ -37,14 +37,16 @@
 mod cdp;
 mod localize;
 mod program;
+mod shield;
 mod worker;
 
 use sicompass_sdk::ffon::{FfonElement, FormMap, FormNodeKind};
 use sicompass_sdk::plugin::{Descriptor, Plugin, PollResult};
 
+use sicompass_sdk::ffon::{html_resolve_href, html_submit_selector};
 #[cfg(test)]
-use sicompass_sdk::ffon::html_to_ffon;
-use sicompass_sdk::ffon::{html_resolve_href, html_submit_selector, html_to_ffon_with_forms};
+use sicompass_sdk::ffon::{html_to_ffon, html_to_ffon_with_forms};
+use sicompass_sdk::tags;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -348,7 +350,7 @@ impl WebbrowserProvider {
                 set_error(&self.pending_error, error.clone());
                 self.cached_page = Some(CachedPage {
                     url: self.current_url.clone(),
-                    elements: vec![FfonElement::new_str(error)],
+                    elements: vec![FfonElement::new_str(tags::escape(&error))],
                 });
                 self.form_map = FormMap::new();
                 self.loading = false;
@@ -665,6 +667,7 @@ impl WebbrowserProvider {
                 } else {
                     String::new()
                 };
+                let u = tags::escape(u);
                 FfonElement::new_str(format!("<button>{u}</button>{mark}{u}"))
             })
             .collect()
@@ -696,8 +699,10 @@ impl WebbrowserProvider {
         let Some(page) = &mut self.cached_page else {
             return;
         };
-        let prefix = format!("{field_label}: <input>");
-        let replacement = format!("{field_label}: <input>{new_value}</input>");
+        // `form_key` is plain and the row is as the walker wrote it.
+        let label = tags::escape(field_label);
+        let prefix = format!("{label}: <input>");
+        let replacement = format!("{label}: <input>{}</input>", tags::escape(new_value));
         patch_form_field_in_tree(&mut page.elements, form_name, &prefix, &replacement);
     }
 
@@ -745,9 +750,9 @@ impl WebbrowserProvider {
         let url_bar = format!(
             "<input>{}</input>",
             if self.current_url.is_empty() {
-                "https://"
+                "https://".to_owned()
             } else {
-                &self.current_url
+                tags::escape(&self.current_url)
             }
         );
 
@@ -787,9 +792,20 @@ impl WebbrowserProvider {
         result
     }
 
-    pub fn commit_edit(&mut self, _old: &str, new_content: &str) -> bool {
-        // Check if the current path points to a form field.
-        if let Some(form_key) = extract_form_key(&self.path_cache)
+    pub fn commit_edit(&mut self, old: &str, new_content: &str) -> bool {
+        // `new_content` is what was typed. But Enter on a field, with no edit,
+        // commits the field as it stands, and then both are the raw slice of the
+        // row, escapes and all.
+        let unedited;
+        let new_content = if old == new_content {
+            unedited = shield::unescape(new_content);
+            unedited.as_str()
+        } else {
+            new_content
+        };
+        // Check if the current path points to a form field. Its last segment is
+        // the text in front of the row's `<input>`, which the app pushes raw.
+        if let Some(form_key) = extract_form_key(&self.path_cache).map(|k| shield::unescape(&k))
             && self.form_map.contains_key(&form_key)
         {
             // Record the typed value, and fill the live Chrome DOM with it
@@ -849,8 +865,10 @@ impl WebbrowserProvider {
         // Matched by membership rather than by shape, so a button the *page*
         // happens to carry can never be mistaken for a history row and
         // navigate the tab out from under the user.
-        if self.url_history.iter().any(|u| u == function_name) {
-            let url = function_name.to_owned();
+        // The app hands the function name back raw.
+        let function_name = shield::unescape(function_name);
+        if self.url_history.contains(&function_name) {
+            let url = function_name;
             self.record_url_history(&url);
             self.load_url(&url);
             return;
@@ -1020,12 +1038,14 @@ impl WebbrowserProvider {
     ///    URL that went through `load_url` and would bookmark the wrong page.
     /// 3. Otherwise the loaded URL — the URL bar, or plain page content.
     fn bookmark_target(&self, elem_key: &str) -> Option<String> {
-        if let Some(name) = sicompass_sdk::tags::extract_button_function_name(elem_key)
+        // Both are raw slices of the row.
+        if let Some(name) =
+            tags::extract_button_function_name(elem_key).map(|name| shield::unescape(&name))
             && self.url_history.contains(&name)
         {
             return Some(name);
         }
-        if let Some(url) = sicompass_sdk::tags::extract_link(elem_key)
+        if let Some(url) = tags::extract_link(elem_key).map(|url| shield::unescape(&url))
             && (url.starts_with("http://") || url.starts_with("https://"))
         {
             return sanitize_history_url(&url);
@@ -1777,7 +1797,7 @@ fn declared_languages(html: &str, url: &str) -> Vec<(String, String)> {
 /// the load flow recorded, then whatever the content itself gives away, and the
 /// page's own language versions as a trailing section.
 fn page_to_ffon_with_forms(load: &PageLoad, url: &str) -> (Vec<FfonElement>, FormMap) {
-    let (mut elements, form_map) = html_to_ffon_with_forms(&load.html, url);
+    let (mut elements, form_map) = shield::html_to_rows(&load.html, url);
     let notices: Vec<String> = load
         .notices
         .iter()
@@ -1799,7 +1819,12 @@ fn page_to_ffon_with_forms(load: &PageLoad, url: &str) -> (Vec<FfonElement>, For
         let mut section = FfonElement::new_obj(localize::t("webbrowser-languages"));
         if let Some(obj) = section.as_obj_mut() {
             for (label, href) in languages {
-                obj.push(FfonElement::new_obj(format!("{label} <link>{href}</link>")));
+                // From `<head>`, past the walker: a page names these codes and URLs.
+                obj.push(FfonElement::new_obj(format!(
+                    "{} <link>{}</link>",
+                    tags::escape(&label),
+                    shield::link_value(&href)
+                )));
             }
         }
         elements.push(section);
@@ -1814,7 +1839,9 @@ fn page_to_ffon_with_forms(load: &PageLoad, url: &str) -> (Vec<FfonElement>, For
 fn render_page(chrome: &mut cdp::Chrome, url: &str) -> Vec<FfonElement> {
     match fetch_page(chrome, url) {
         Ok(load) => page_to_ffon_with_forms(&load, url).0,
-        Err(e) => vec![FfonElement::new_str(format!("Error loading {url}: {e}"))],
+        Err(e) => vec![FfonElement::new_str(tags::escape(&format!(
+            "Error loading {url}: {e}"
+        )))],
     }
 }
 
@@ -5827,6 +5854,269 @@ mod tests {
     }
 
     // ---- take_error draining ----
+
+    // ---- Markup: this provider's own rows (the page's are in `shield`) ----
+
+    /// Text that would be live if it reached a row as written.
+    const HOSTILE: [&str; 6] = [
+        "<b>x</b>",
+        r#"<img src="/etc/passwd">"#,
+        "<style>li { color: red }</style>",
+        "<input>y</input>",
+        "<button>go</button>",
+        r"ends in a backslash\",
+    ];
+
+    fn raw_of(element: &FfonElement) -> &str {
+        match element {
+            FfonElement::Str(s) => s,
+            FfonElement::Obj(o) => &o.key,
+        }
+    }
+
+    fn assert_no_page_tags(raw: &str) {
+        assert!(!sicompass_sdk::markup::has_markup(raw), "markup in {raw}");
+        assert!(sicompass_sdk::markup::style_sheet(raw).is_none(), "{raw}");
+        assert!(sicompass_sdk::markup::targets(raw).is_empty(), "{raw}");
+        assert!(tags::targets(raw).is_empty(), "{raw}");
+    }
+
+    fn html_attr(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+
+    #[test]
+    fn the_manifest_asks_for_markup() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../plugin.json")).unwrap();
+        assert_eq!(manifest["markup"], serde_json::json!(true));
+    }
+
+    /// The URL bar, typed into and then entered again with no edit, when the app
+    /// commits the raw slice of the row as both `old` and `new`.
+    #[test]
+    fn a_hostile_url_in_the_bar_stays_text_and_keeps_its_bytes() {
+        let _flag = launch_flag_guard(true);
+        for text in HOSTILE {
+            let dir = tempfile::tempdir().unwrap();
+            let mut p = history_provider(dir.path());
+            let url = format!("https://x.invalid/{text}");
+            p.commit_edit("", &url);
+            assert_eq!(p.current_url, url);
+
+            let result = p.fetch();
+            let bar = raw_of(&result[0]);
+            assert!(!sicompass_sdk::markup::has_markup(bar), "markup in {bar}");
+            assert!(sicompass_sdk::markup::targets(bar).is_empty(), "{bar}");
+            assert!(tags::targets(bar).is_empty(), "{bar}");
+            assert_eq!(tags::strip_display(bar), url, "{bar}");
+
+            let raw = tags::extract_input(bar).unwrap();
+            assert_eq!(raw, tags::escape(&url));
+            assert_eq!(tags::strip_display(&raw), url, "the edit field");
+            p.commit_edit(&raw, &raw);
+            assert_eq!(p.current_url, url, "no backslash gained");
+        }
+    }
+
+    /// A history row is a real button, on the URL, whichever way the URL got in.
+    #[test]
+    fn a_hostile_history_row_is_only_its_own_button() {
+        let _flag = launch_flag_guard(true);
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = history_provider(dir.path());
+        // Whatever is on disk goes through `sanitize_history_url`, which encodes
+        // brackets. This is the row's own line of defence.
+        let url = "https://x.invalid/<img/src=/etc/passwd>";
+        p.url_history = vec![url.to_owned()];
+        let rows = p.history_buttons();
+        let row = raw_of(&rows[0]);
+        assert!(!sicompass_sdk::markup::has_markup(row), "markup in {row}");
+        let targets = tags::targets(row);
+        assert_eq!(targets.len(), 1, "{row}");
+        assert_eq!(targets[0].kind, tags::TargetKind::Button);
+        assert_eq!(tags::strip_display(row), url);
+
+        // The app hands the function name back raw.
+        let name = tags::extract_button_function_name(row).unwrap();
+        p.on_button_press(&name);
+        assert_eq!(p.current_url, url, "followed without a backslash");
+    }
+
+    #[test]
+    fn a_hostile_history_line_on_disk_reads_as_an_encoded_url() {
+        let _flag = launch_flag_guard(true);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("history"),
+            "https://x.invalid/<img/src=/etc/passwd>\n</button><b>x</b>\n",
+        )
+        .unwrap();
+        let mut p = history_provider(dir.path());
+        p.load_url_history();
+        assert_eq!(
+            p.url_history,
+            vec![
+                "https://x.invalid/%3Cimg/src=/etc/passwd%3E",
+                "%3C/button%3E%3Cb%3Ex%3C/b%3E",
+            ]
+        );
+        for row in p.history_buttons() {
+            let row = raw_of(&row).to_owned();
+            assert!(!sicompass_sdk::markup::has_markup(&row), "{row}");
+            assert_eq!(tags::targets(&row).len(), 1, "{row}");
+        }
+    }
+
+    /// A bookmark reads a raw slice of the row, and never saves a backslash.
+    #[test]
+    fn a_bookmark_target_gains_no_backslash() {
+        let mut p = WebbrowserProvider::new();
+        assert_eq!(
+            p.bookmark_target(r"a page <link>https://x.invalid/\<b\></link>")
+                .as_deref(),
+            Some("https://x.invalid/%3Cb%3E")
+        );
+        p.url_history = vec!["https://x.invalid/<b>".to_owned()];
+        assert_eq!(
+            p.bookmark_target(r"<button>https://x.invalid/\<b\></button>x")
+                .as_deref(),
+            Some("https://x.invalid/<b>")
+        );
+    }
+
+    /// A failed load reads as a page, and its message quotes the URL. The status
+    /// line is not a row, and shows it as it is.
+    #[test]
+    fn a_hostile_url_in_a_failed_load_stays_text() {
+        for text in HOSTILE {
+            let mut p = WebbrowserProvider::new();
+            let error = format!("Error loading https://x.invalid/{text}: net::ERR");
+            p.apply_done(worker::Done::Failed {
+                seq: p.nav_seq,
+                error: error.clone(),
+            });
+            let page = &p.cached_page.as_ref().unwrap().elements;
+            let row = raw_of(&page[0]);
+            assert_no_page_tags(row);
+            assert_eq!(tags::strip_display(row), error);
+            assert_eq!(p.take_error().as_deref(), Some(error.as_str()));
+        }
+    }
+
+    /// A consent choice is a page's own label, on a page this plugin builds.
+    #[test]
+    fn a_hostile_consent_label_stays_text() {
+        for text in HOSTILE {
+            let html = gate_page_html(&[text.to_owned()], &["sic-consent-0".to_owned()]);
+            let (elements, forms) =
+                page_to_ffon_with_forms(&PageLoad::plain(html), "https://a.invalid/");
+            let FfonElement::Obj(form) = &elements[0] else {
+                panic!("a form");
+            };
+            let row = raw_of(&form.children[0]);
+            assert!(!sicompass_sdk::markup::has_markup(row), "markup in {row}");
+            let targets = tags::targets(row);
+            assert_eq!(targets.len(), 1, "{row}");
+            assert_eq!(targets[0].value, "submit:form_1", "{row}");
+            assert_eq!(
+                tags::extract_button_display_text(row).unwrap(),
+                tags::escape(text)
+            );
+            assert!(forms.contains_key(&format!("form_1/{text}")), "{forms:?}");
+        }
+    }
+
+    /// The language section comes from `<head>`, past the walker.
+    #[test]
+    fn hostile_language_alternates_stay_text() {
+        let html = r#"<!DOCTYPE html><html lang="en"><head>
+            <link rel="alternate" hreflang="&lt;img src=x&gt;" href="https://a.invalid/&lt;b&gt;x">
+            <link rel="alternate" hreflang="fr" href="https://a.invalid/fr">
+            </head><body><p>text</p></body></html>"#;
+        let (elements, _) = page_to_ffon_with_forms(
+            &PageLoad::plain(html.to_owned()),
+            "https://a.invalid/<i>here",
+        );
+        let FfonElement::Obj(section) = elements.last().unwrap() else {
+            panic!("a language section");
+        };
+        let rows: Vec<&str> = section.children.iter().map(raw_of).collect();
+        assert_eq!(
+            rows[0], r"\<IMG SRC=X\> <link>https://a.invalid/%3Cb%3Ex</link>",
+            "{rows:?}"
+        );
+        for row in &rows {
+            assert!(!sicompass_sdk::markup::has_markup(row), "markup in {row}");
+            let value = tags::extract_link(row).unwrap();
+            assert!(!value.contains(['<', '>', '\\']), "{row}");
+        }
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("https://a.invalid/%3Ci%3Ehere"))
+        );
+    }
+
+    /// A form: the label and the value are the page's, and what gets filled in is
+    /// what was typed. The app pushes the raw text in front of `<input>`, and on
+    /// Enter with no edit commits the raw slice of the row.
+    #[test]
+    fn a_form_field_keeps_the_bytes_both_ways() {
+        for text in HOSTILE {
+            let attr = html_attr(text);
+            let html = format!(
+                r#"<!DOCTYPE html><html><body><form><input id="f" placeholder="{attr}" value="{attr}"></form></body></html>"#
+            );
+            let url = "https://a.invalid/";
+            let (elements, forms) = page_to_ffon_with_forms(&PageLoad::plain(html), url);
+            let mut p = WebbrowserProvider::new();
+            p.cached_page = Some(CachedPage {
+                url: url.to_owned(),
+                elements,
+            });
+            p.form_map = forms;
+
+            let page = &p.cached_page.as_ref().unwrap().elements;
+            let row = raw_of(&page[0].as_obj().unwrap().children[0]).to_owned();
+            assert_no_page_tags(&row);
+            let field = tags::extract_input(&row).unwrap();
+            assert_eq!(
+                tags::strip_display(&field),
+                text,
+                "what the field opens with"
+            );
+
+            let open = row.find("<input>").unwrap();
+            let label = row[..open].trim_end().strip_suffix(':').unwrap().trim();
+            p.push_path(url);
+            p.push_path("form_1");
+            p.push_path(label);
+            let key = format!("form_1/{text}");
+
+            // Enter on the field, no edit.
+            assert!(!p.commit_edit(&field, &field));
+            assert_eq!(p.form_field_values[&key], text, "unedited");
+
+            // Typed: `new` is plain, and goes to the page as it is.
+            let typed = format!("{text} and more");
+            assert!(!p.commit_edit(&field, &typed));
+            assert_eq!(p.form_field_values[&key], typed, "typed");
+            let page = &p.cached_page.as_ref().unwrap().elements;
+            let row = raw_of(&page[0].as_obj().unwrap().children[0]);
+            assert_no_page_tags(row);
+            assert_eq!(
+                tags::strip_display(&tags::extract_input(row).unwrap()),
+                typed,
+                "{row}"
+            );
+
+            // The field the app shows from then on is still escaped.
+            assert_eq!(tags::extract_input(row).unwrap(), tags::escape(&typed));
+        }
+    }
 
     #[test]
     fn take_error_drains_pending_error_once() {
