@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3
+
+- A page's words can never become a tag, and history, bookmarks and form values read back without escapes.
+- Needs sicompass 0.2.4.
+- Intel macs are not built any more.
+
 ## 0.3.2
 
 - On Windows, a Chrome left running on the plugin's profile is ended, and Chrome no longer outlives the plugin, so the browser starts again.
